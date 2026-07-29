@@ -42,5 +42,5 @@ jobs:
       - name: Verify bundle metadata
         run: |
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' dist/ThermoFan.app/Contents/Info.plist)" = "io.github.girginomer10.ThermoFan"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.2.3"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.2.4"
           test "$(dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper --version)" = "5"

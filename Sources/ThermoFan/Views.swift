@@ -333,11 +333,11 @@ struct HelperStatusRow: View {
             Spacer(minLength: 8)
             if store.installingHelper {
                 ProgressView().controlSize(.small)
-            } else if !store.helperInstalled {
+            } else if store.helperState != .ready {
                 Button {
                     store.installHelper()
                 } label: {
-                    Label(store.helperState == .updateRequired ? "Update" : "Install", systemImage: "arrow.down.circle")
+                    Label(store.helperState == .missing ? "Install" : "Update", systemImage: "arrow.down.circle")
                 }
             }
         }
@@ -349,6 +349,7 @@ struct HelperStatusRow: View {
         switch store.helperState {
         case .missing: "Hardware Helper not installed"
         case .updateRequired: "Hardware Helper update required"
+        case .legacyCompatible: "Compatible Hardware Helper ready"
         case .ready: "Hardware Helper ready"
         }
     }
@@ -357,6 +358,7 @@ struct HelperStatusRow: View {
         switch store.helperState {
         case .missing: "Install once to control fans without repeated password prompts."
         case .updateRequired: "Update once to enable reliable curve tracking and crash recovery."
+        case .legacyCompatible: "Fan control works now. Update once to adopt the public helper identity."
         case .ready: "Fan writes, curve tracking, and crash recovery are available."
         }
     }
@@ -365,6 +367,7 @@ struct HelperStatusRow: View {
         switch store.helperState {
         case .missing: "lock.shield"
         case .updateRequired: "exclamationmark.shield.fill"
+        case .legacyCompatible: "checkmark.shield"
         case .ready: "checkmark.shield.fill"
         }
     }
@@ -924,7 +927,7 @@ struct CompactFanCard: View {
         switch store.helperState {
         case .missing: "Install & Apply"
         case .updateRequired: "Update & Apply"
-        case .ready: fan.controlState == .failed ? "Retry" : "Apply"
+        case .legacyCompatible, .ready: fan.controlState == .failed ? "Retry" : "Apply"
         }
     }
 
@@ -1105,7 +1108,7 @@ struct FullFanCard: View {
         switch store.helperState {
         case .missing: "Install Helper & Apply"
         case .updateRequired: "Update Helper & Apply"
-        case .ready: fan.controlState == .failed ? "Retry Hardware Write" : "Apply to Hardware"
+        case .legacyCompatible, .ready: fan.controlState == .failed ? "Retry Hardware Write" : "Apply to Hardware"
         }
     }
 

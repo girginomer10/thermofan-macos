@@ -51,7 +51,7 @@ final class ThermalStore: ObservableObject {
     private static let curveHysteresisRPM = 100
 
     var helperInstalled: Bool {
-        helperState == .ready
+        helperState.isUsable
     }
 
     init() {
@@ -480,7 +480,7 @@ final class ThermalStore: ObservableObject {
         applyingFanIDs.insert(fanID)
 
         controlQueue.async {
-            if control.persistentHelperState != .ready {
+            if !control.isPersistentHelperInstalled {
                 switch control.installPersistentHelper() {
                 case .applied:
                     break
@@ -580,7 +580,7 @@ final class ThermalStore: ObservableObject {
     /// Installs the Hardware Helper without applying a specific fan (used by the
     /// General settings pane's Install button). Runs off the main actor.
     func installHelper() {
-        guard !helperInstalled, !installingHelper else { return }
+        guard helperState != .ready, !installingHelper else { return }
         let control = fanControl
         installingHelper = true
         controlQueue.async {

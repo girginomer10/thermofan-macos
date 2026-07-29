@@ -93,8 +93,9 @@ authorization once and installs:
 
 The helper is root-owned, narrowly accepts fan-control commands, clamps RPM to
 the range reported by the SMC, and verifies mode and target writes. Version
-0.2.3 also removes the earlier `local.codex.ThermoFan.helper` path during this
-one-time migration.
+0.2.4 can keep using a verified v4 `local.codex.ThermoFan.helper` without a new
+password prompt. The optional Helper update moves it to the public identity and
+removes the legacy path.
 
 ## Development
 

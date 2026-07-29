@@ -7,6 +7,15 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-29
+
+### Fixed
+
+- Existing root-owned v4 helpers remain usable after strict permission and
+  version validation, so the public helper-identity migration does not block fan
+  control behind another administrator prompt.
+- The optional Helper update still installs v5 and removes the legacy path.
+
 ## [0.2.3] - 2026-07-29
 
 ### Added
@@ -39,5 +48,6 @@ and the project uses semantic versioning while it remains pre-1.0.
 - Helper updates no longer require an administrator password for every fan
   change.
 
-[Unreleased]: https://github.com/girginomer10/thermofan-macos/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/girginomer10/thermofan-macos/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/girginomer10/thermofan-macos/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/girginomer10/thermofan-macos/releases/tag/v0.2.3

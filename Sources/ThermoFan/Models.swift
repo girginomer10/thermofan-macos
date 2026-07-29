@@ -140,14 +140,20 @@ enum FanControlState: Hashable {
 enum HardwareHelperState: Hashable {
     case missing
     case updateRequired
+    case legacyCompatible
     case ready
 
     var title: String {
         switch self {
         case .missing: "Not installed"
         case .updateRequired: "Update required"
+        case .legacyCompatible: "Compatible update available"
         case .ready: "Ready"
         }
+    }
+
+    var isUsable: Bool {
+        self == .ready || self == .legacyCompatible
     }
 }
 

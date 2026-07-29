@@ -72,11 +72,14 @@ final class PersistenceController: @unchecked Sendable {
 final class FanControlService: @unchecked Sendable {
     private let installedHelperPath = "/Library/PrivilegedHelperTools/io.github.girginomer10.ThermoFan.helper"
     private let installedHelperVersionPath = "/Library/PrivilegedHelperTools/io.github.girginomer10.ThermoFan.helper.version"
+    private let legacyHelperPath = "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper"
+    private let legacyHelperVersionPath = "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper.version"
     private let legacyHelperPaths = [
         "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper",
         "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper.version"
     ]
     private static let expectedHelperVersion = "5"
+    private static let compatibleLegacyHelperVersion = "4"
 
     enum ApplyResult {
         case applied(String)
@@ -84,38 +87,32 @@ final class FanControlService: @unchecked Sendable {
     }
 
     var persistentHelperState: HardwareHelperState {
-        guard
-            FileManager.default.isExecutableFile(atPath: installedHelperPath),
-            let attributes = try? FileManager.default.attributesOfItem(atPath: installedHelperPath),
-            let type = attributes[.type] as? FileAttributeType,
-            let owner = attributes[.ownerAccountID] as? NSNumber,
-            let group = attributes[.groupOwnerAccountID] as? NSNumber,
-            let permissions = attributes[.posixPermissions] as? NSNumber
-        else {
-            return .missing
+        if helperIsValid(
+            at: installedHelperPath,
+            versionPath: installedHelperVersionPath,
+            expectedVersion: Self.expectedHelperVersion
+        ) {
+            return .ready
         }
 
-        guard
-            type == .typeRegular,
-            owner.intValue == 0,
-            group.intValue == 0,
-            (permissions.intValue & 0o4777) == 0o4755
-        else {
-            return .missing
+        if helperIsValid(
+            at: legacyHelperPath,
+            versionPath: legacyHelperVersionPath,
+            expectedVersion: Self.compatibleLegacyHelperVersion
+        ) {
+            return .legacyCompatible
         }
 
-        guard
-            let version = try? String(contentsOfFile: installedHelperVersionPath, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            version == Self.expectedHelperVersion
-        else {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: installedHelperPath)
+            || fileManager.fileExists(atPath: legacyHelperPath) {
             return .updateRequired
         }
-        return .ready
+        return .missing
     }
 
     var isPersistentHelperInstalled: Bool {
-        persistentHelperState == .ready
+        activeHelperPath != nil
     }
 
     func installPersistentHelper() -> ApplyResult {
@@ -151,7 +148,7 @@ final class FanControlService: @unchecked Sendable {
             ].joined(separator: " && ")
             let script = "do shell script \(Self.appleScriptLiteral(command)) with administrator privileges"
             _ = try Self.runProcess(executable: "/usr/bin/osascript", arguments: ["-e", script])
-            return isPersistentHelperInstalled
+            return persistentHelperState == .ready
                 ? .applied("Hardware Helper is ready. Fan changes no longer need repeated password prompts.")
                 : .failed("Hardware Helper installation finished, but its version or permissions could not be verified.")
         } catch {
@@ -171,14 +168,14 @@ final class FanControlService: @unchecked Sendable {
     }
 
     func startWatchdog(for fan: FanDevice, parentPID: Int32) throws {
-        guard isPersistentHelperInstalled else {
+        guard let helperPath = activeHelperPath else {
             throw FanControlError.helperMissing
         }
         guard let fanIndex = Self.fanIndex(from: fan.id) else {
             throw FanControlError.invalidFanIdentifier(fan.id)
         }
         try Self.runDetachedProcess(
-            executable: installedHelperPath,
+            executable: helperPath,
             arguments: ["--watch", "\(parentPID)", "\(fanIndex)"]
         )
     }
@@ -269,6 +266,9 @@ final class FanControlService: @unchecked Sendable {
     }
 
     private func runPersistentHelper(for fan: FanDevice) throws -> String {
+        guard let helperPath = activeHelperPath else {
+            throw FanControlError.helperMissing
+        }
         guard let fanIndex = Self.fanIndex(from: fan.id) else {
             throw FanControlError.invalidFanIdentifier(fan.id)
         }
@@ -277,8 +277,56 @@ final class FanControlService: @unchecked Sendable {
             arguments.append("\(fan.targetRPM)")
         }
 
-        let output = try Self.runProcess(executable: installedHelperPath, arguments: arguments)
+        let output = try Self.runProcess(executable: helperPath, arguments: arguments)
         return output.isEmpty ? "Hardware command applied." : output
+    }
+
+    private var activeHelperPath: String? {
+        if helperIsValid(
+            at: installedHelperPath,
+            versionPath: installedHelperVersionPath,
+            expectedVersion: Self.expectedHelperVersion
+        ) {
+            return installedHelperPath
+        }
+        if helperIsValid(
+            at: legacyHelperPath,
+            versionPath: legacyHelperVersionPath,
+            expectedVersion: Self.compatibleLegacyHelperVersion
+        ) {
+            return legacyHelperPath
+        }
+        return nil
+    }
+
+    private func helperIsValid(at path: String, versionPath: String, expectedVersion: String) -> Bool {
+        guard
+            FileManager.default.isExecutableFile(atPath: path),
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+            let type = attributes[.type] as? FileAttributeType,
+            let owner = attributes[.ownerAccountID] as? NSNumber,
+            let group = attributes[.groupOwnerAccountID] as? NSNumber,
+            let permissions = attributes[.posixPermissions] as? NSNumber,
+            type == .typeRegular,
+            owner.intValue == 0,
+            group.intValue == 0,
+            (permissions.intValue & 0o4777) == 0o4755,
+            let versionAttributes = try? FileManager.default.attributesOfItem(atPath: versionPath),
+            let versionType = versionAttributes[.type] as? FileAttributeType,
+            let versionOwner = versionAttributes[.ownerAccountID] as? NSNumber,
+            let versionGroup = versionAttributes[.groupOwnerAccountID] as? NSNumber,
+            let versionPermissions = versionAttributes[.posixPermissions] as? NSNumber,
+            versionType == .typeRegular,
+            versionOwner.intValue == 0,
+            versionGroup.intValue == 0,
+            (versionPermissions.intValue & 0o777) == 0o644,
+            let version = try? String(contentsOfFile: versionPath, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            version == expectedVersion
+        else {
+            return false
+        }
+        return true
     }
 
     /// Vets the helper binary before it is copied and made setuid-root. This is

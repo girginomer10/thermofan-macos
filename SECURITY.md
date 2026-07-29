@@ -9,7 +9,7 @@ automatic-mode recovery are especially important.
 
 | Version | Supported |
 | --- | --- |
-| 0.2.3 | Yes |
+| 0.2.4 | Yes |
 | Earlier versions | No |
 
 ## Reporting a Vulnerability

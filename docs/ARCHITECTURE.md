@@ -56,6 +56,11 @@ The bundled helper is ad-hoc signed as part of the local build. Its installer:
 - records a root-owned version marker;
 - removes the legacy helper path.
 
+An existing root-owned v4 helper at the legacy path remains usable after its
+permissions and version marker are validated. This avoids an unnecessary
+administrator prompt during migration while keeping the v5 update visible in
+General settings.
+
 The current implementation uses a narrowly scoped setuid helper so repeated fan
 changes do not require repeated administrator prompts. A signed and notarized
 XPC helper would be the preferred distribution model for a future binary
