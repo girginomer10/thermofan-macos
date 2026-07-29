@@ -1,0 +1,84 @@
+name: Bug report
+description: Report a reproducible ThermoFan problem.
+title: "[Bug]: "
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Return affected fans to Auto before collecting diagnostics. Use private vulnerability reporting for security issues.
+
+  - type: input
+    id: version
+    attributes:
+      label: ThermoFan version
+      placeholder: 0.2.3
+    validations:
+      required: true
+
+  - type: input
+    id: mac
+    attributes:
+      label: Mac model and chip
+      placeholder: Mac16,11 / Apple M4 Pro
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: macOS 26.5.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: helper
+    attributes:
+      label: Hardware Helper status
+      options:
+        - Ready
+        - Update required
+        - Missing
+        - Install failed
+        - Not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include expected behavior and actual behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Apply ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Relevant diagnostic output
+      description: Remove unrelated lines and review hardware identifiers before posting.
+      render: shell
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I returned affected fans to Auto, or fan control was not involved.
+          required: true
+        - label: I checked that this is not an unpatched security vulnerability.
+          required: true

@@ -1,0 +1,12 @@
+.DS_Store
+.claude/
+.build/
+DerivedData/
+*.app
+*.dSYM/
+*.zip
+*.xcuserstate
+*.xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.swiftpm/
+dist/

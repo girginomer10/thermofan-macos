@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose an improvement to ThermoFan.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - needs-triage
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow or limitation should be improved?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the user-facing result, not only an implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Does this change hardware-control behavior?
+      options:
+        - "No"
+        - "Yes"
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware_context
+    attributes:
+      label: Hardware context
+      description: If relevant, include Mac model, chip, and macOS version.

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Test
+        run: swift test
+
+      - name: Validate build script
+        run: bash -n scripts/build_app.sh
+
+      - name: Build app bundle
+        run: ./scripts/build_app.sh
+
+      - name: Verify code signatures
+        run: |
+          codesign --verify --strict dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper
+          codesign --verify --deep --strict dist/ThermoFan.app
+
+      - name: Verify bundle metadata
+        run: |
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' dist/ThermoFan.app/Contents/Info.plist)" = "io.github.girginomer10.ThermoFan"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.2.3"
+          test "$(dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper --version)" = "5"

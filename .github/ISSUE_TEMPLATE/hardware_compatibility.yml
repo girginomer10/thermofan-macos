@@ -1,0 +1,86 @@
+name: Hardware compatibility report
+description: Share verified sensor and fan behavior for a Mac model.
+title: "[Hardware]: "
+labels:
+  - compatibility
+  - hardware
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Mac model identifier
+      placeholder: Mac16,11
+    validations:
+      required: true
+
+  - type: input
+    id: chip
+    attributes:
+      label: Chip or processor
+      placeholder: Apple M4 Pro
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: ThermoFan version or commit
+      placeholder: 0.2.3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sensor_reading
+    attributes:
+      label: Temperature readings
+      options:
+        - Real SMC readings available
+        - Real PMU/HID readings available
+        - Both SMC and PMU/HID readings available
+        - Estimated fallback only
+        - No readings
+    validations:
+      required: true
+
+  - type: dropdown
+    id: fan_control
+    attributes:
+      label: Fan-control test performed
+      options:
+        - Read-only diagnostics
+        - Auto return only
+        - Fixed RPM and Auto return
+        - Curve and Auto return
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Verified result
+      description: Include fan count, range, target read-back, current RPM response, and Auto return when tested.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostic excerpt
+      render: shell
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I observed this behavior on the physical Mac listed above.
+          required: true
+        - label: Any tested fan is currently back in Auto mode.
+          required: true
