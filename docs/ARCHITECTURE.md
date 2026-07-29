@@ -23,8 +23,11 @@ SMC fan writes. All sensor processing and persistence stay on the local Mac.
 1. `HardwareProbe` opens the AppleSMC service when available.
 2. Known, model-appropriate SMC keys are decoded by their declared data type.
 3. Apple PMU/HID temperatures supplement SMC readings.
-4. `ThermalStore` creates built-in and custom indexes from real sensor values.
-5. SwiftUI observes the store and renders the menu bar and settings views.
+4. Already-discovered SMC sensors remain in the session topology when a key
+   temporarily sleeps; its unchanged `updatedAt` marks the value as stale.
+5. `ThermalStore` creates indexes from fresh contributors and keeps current
+   hotspot sensors as safe fallbacks for fan curves.
+6. SwiftUI observes the store and renders the menu bar and settings views.
 
 Estimated fallback temperatures are separate, marked as estimated, and disabled
 by default.

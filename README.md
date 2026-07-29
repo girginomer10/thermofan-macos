@@ -31,6 +31,8 @@ mode have been read back from the SMC.
 - Direct numeric editing for every curve point
 - Built-in CPU, GPU, and system hotspot indexes
 - User-defined hottest-value or average indexes
+- Stable sensor rows for intermittently sleeping SMC core keys, with stale
+  values clearly marked as last readings
 - Read-back verification after every hardware write
 - One-time privileged helper installation instead of repeated password prompts
 - Best-effort automatic-mode recovery on normal quit, crash, force-quit, and

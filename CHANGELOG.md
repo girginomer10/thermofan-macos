@@ -7,6 +7,18 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-07-29
+
+### Fixed
+
+- Performance-core rows no longer disappear when Apple Silicon SMC keys return
+  temporary sleep or sentinel values.
+- Retained values are visibly labeled as last readings instead of being
+  presented as current measurements.
+- Thermal indexes ignore stale contributors when a fresh source is available,
+  and curve control falls back to a current system hotspot instead of following
+  an old per-core reading.
+
 ## [0.2.4] - 2026-07-29
 
 ### Fixed
@@ -48,6 +60,7 @@ and the project uses semantic versioning while it remains pre-1.0.
 - Helper updates no longer require an administrator password for every fan
   change.
 
-[Unreleased]: https://github.com/girginomer10/thermofan-macos/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/girginomer10/thermofan-macos/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/girginomer10/thermofan-macos/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/girginomer10/thermofan-macos/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/girginomer10/thermofan-macos/releases/tag/v0.2.3

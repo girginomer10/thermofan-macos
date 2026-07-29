@@ -21,6 +21,7 @@ struct MenuBarLabel: View {
                     }
                     Text(store.preferences.temperatureUnit.format(sensor.temperatureC))
                         .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .opacity(store.isSensorFresh(sensor) ? 1 : 0.55)
                 }
             }
         }
@@ -31,7 +32,10 @@ struct MenuBarLabel: View {
     private var accessibilityText: String {
         guard !displayedSensors.isEmpty else { return "No sensor reading available" }
         return displayedSensors
-            .map { "\($0.name) \(store.preferences.temperatureUnit.format($0.temperatureC))" }
+            .map {
+                let freshness = store.isSensorFresh($0) ? "" : ", last reading"
+                return "\($0.name) \(store.preferences.temperatureUnit.format($0.temperatureC))\(freshness)"
+            }
             .joined(separator: ", ")
     }
 }
@@ -483,7 +487,7 @@ struct IndexSourceToggle: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(sensor.name)
                         .lineLimit(1)
-                    Text("\(sensor.source.label) · \(store.preferences.temperatureUnit.format(sensor.temperatureC))")
+                    Text(indexSourceDetail)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -493,6 +497,11 @@ struct IndexSourceToggle: View {
         .toggleStyle(.checkbox)
         .padding(8)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var indexSourceDetail: String {
+        let freshness = store.isSensorFresh(sensor) ? "" : " · Last reading"
+        return "\(sensor.source.label) · \(store.preferences.temperatureUnit.format(sensor.temperatureC))\(freshness)"
     }
 }
 
@@ -761,6 +770,7 @@ struct SensorRow: View {
     var compact: Bool
 
     private var isEstimated: Bool { sensor.source == .estimated }
+    private var isStale: Bool { !store.isSensorFresh(sensor) }
     private var inMenuBar: Bool { store.preferences.menuSensorIDs.contains(sensor.id) }
 
     var body: some View {
@@ -771,7 +781,7 @@ struct SensorRow: View {
                     .lineLimit(1)
                     .font(.system(size: compact ? 12 : 13, weight: sensor.isFavorite ? .semibold : .regular))
                 if !compact {
-                    Text(sensor.isHidden ? "\(sensor.source.label) · Hidden" : sensor.source.label)
+                    Text(sensorDetail)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -782,7 +792,8 @@ struct SensorRow: View {
                 .italic(isEstimated)
                 .monospacedDigit()
                 .frame(width: 76, alignment: .trailing)
-                .help(isEstimated ? "Estimated reading — SMC/sensor data was unavailable." : "")
+                .foregroundStyle(isStale ? Color.secondary : Color.primary)
+                .help(temperatureHelp)
 
             if !compact {
                 Button {
@@ -818,6 +829,23 @@ struct SensorRow: View {
         .padding(.vertical, compact ? 5 : 7)
         .opacity(sensor.isHidden ? 0.5 : 1)
         .background(index.isMultiple(of: 2) ? Color(nsColor: .textBackgroundColor).opacity(0.24) : Color(nsColor: .controlBackgroundColor).opacity(0.42))
+    }
+
+    private var sensorDetail: String {
+        if sensor.isHidden {
+            return "\(sensor.source.label) · Hidden"
+        }
+        return isStale ? "\(sensor.source.label) · Last reading" : sensor.source.label
+    }
+
+    private var temperatureHelp: String {
+        if isEstimated {
+            return "Estimated reading; hardware sensor data was unavailable."
+        }
+        if isStale {
+            return "The SMC key is temporarily unavailable; showing its last valid reading."
+        }
+        return ""
     }
 }
 
@@ -948,6 +976,7 @@ struct CompactFanCard: View {
         case .idle: .secondary
         }
     }
+
 }
 
 struct FullFanCard: View {

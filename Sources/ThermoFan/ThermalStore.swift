@@ -54,6 +54,14 @@ final class ThermalStore: ObservableObject {
         helperState.isUsable
     }
 
+    func isSensorFresh(_ sensor: ThermalSensor, now: Date = Date()) -> Bool {
+        SensorContinuity.isFresh(
+            sensor,
+            now: now,
+            refreshInterval: preferences.refreshInterval
+        )
+    }
+
     init() {
         load()
         helperState = fanControl.persistentHelperState
@@ -78,7 +86,9 @@ final class ThermalStore: ObservableObject {
     }
 
     var hottestSensor: ThermalSensor? {
-        unhiddenSensors.max { $0.temperatureC < $1.temperatureC }
+        let freshSensors = unhiddenSensors.filter { isSensorFresh($0) }
+        return (freshSensors.isEmpty ? unhiddenSensors : freshSensors)
+            .max { $0.temperatureC < $1.temperatureC }
     }
 
     var menuSensors: [ThermalSensor] {
@@ -182,7 +192,11 @@ final class ThermalStore: ObservableObject {
         machine = snapshot.machine
         warnings = snapshot.warnings + appWarnings
         helperState = fanControl.persistentHelperState
-        sensors = mergeSensors(addIndexes(to: snapshot.sensors))
+        let continuousSensors = SensorContinuity.merging(
+            incoming: snapshot.sensors,
+            previous: sensors
+        )
+        sensors = mergeSensors(addIndexes(to: continuousSensors))
         // Keep the last-known fan configuration if a sample momentarily returns
         // no fans (transient SMC read failure) so hand-tuned curves aren't wiped.
         if !snapshot.fans.isEmpty {
@@ -803,6 +817,10 @@ final class ThermalStore: ObservableObject {
                 || ["Tp01", "Tp05", "Tp0D"].contains(sensor.id)
             )
         }
+        let performanceFallback = sensors.filter { ["TCMz", "TCMb"].contains($0.id) }
+        let performanceSensorIDs = Set(performanceSensors.map(\.id))
+        let performanceIndexSensors = performanceSensors
+            + performanceFallback.filter { !performanceSensorIDs.contains($0.id) }
         appendIndex(
             to: &indexes,
             id: "index-cpu-average",
@@ -827,9 +845,7 @@ final class ThermalStore: ObservableObject {
             name: "CPU Performance Index",
             category: .cpu,
             mode: .hottest,
-            sensors: performanceSensors.isEmpty
-                ? sensors.filter { ["TCMz", "TCMb"].contains($0.id) }
-                : performanceSensors
+            sensors: performanceIndexSensors
         )
 
         appendIndex(
@@ -915,7 +931,9 @@ final class ThermalStore: ObservableObject {
         sensors: [ThermalSensor],
         isFavorite: Bool
     ) -> ThermalSensor? {
-        let values = sensors.map(\.temperatureC).filter(\.isFinite)
+        let freshSensors = sensors.filter { isSensorFresh($0) }
+        let contributors = freshSensors.isEmpty ? sensors : freshSensors
+        let values = contributors.map(\.temperatureC).filter(\.isFinite)
         guard !values.isEmpty else { return nil }
         let value: Double
         switch mode {
@@ -933,7 +951,7 @@ final class ThermalStore: ObservableObject {
             source: .index,
             isFavorite: isFavorite,
             isHidden: false,
-            updatedAt: sensors.map(\.updatedAt).max() ?? Date()
+            updatedAt: contributors.map(\.updatedAt).max() ?? Date()
         )
     }
 
@@ -991,7 +1009,10 @@ final class ThermalStore: ObservableObject {
             let linkedSensor = fans[index].linkedSensorID.flatMap { linkedSensorID in
                 sensors.first(where: { $0.id == linkedSensorID })
             }
-            guard let sensor = linkedSensor ?? recommendedCurveSensor else {
+            let currentLinkedSensor = linkedSensor.flatMap { sensor in
+                isSensorFresh(sensor) ? sensor : nil
+            }
+            guard let sensor = currentLinkedSensor ?? recommendedCurveSensor else {
                 continue
             }
             let sourceWasMissing = fans[index].linkedSensorID != nil && linkedSensor == nil
@@ -1019,10 +1040,10 @@ final class ThermalStore: ObservableObject {
     }
 
     private var recommendedCurveSensor: ThermalSensor? {
-        sensors.first { $0.id == "index-system-hotspot" && !$0.isHidden }
-            ?? sensors.first { $0.id == "TCMz" && !$0.isHidden }
+        sensors.first { $0.id == "index-system-hotspot" && !$0.isHidden && isSensorFresh($0) }
+            ?? sensors.first { $0.id == "TCMz" && !$0.isHidden && isSensorFresh($0) }
             ?? unhiddenSensors
-                .filter { [.cpu, .gpu, .power].contains($0.category) }
+                .filter { [.cpu, .gpu, .power].contains($0.category) && isSensorFresh($0) }
                 .max { $0.temperatureC < $1.temperatureC }
     }
 
