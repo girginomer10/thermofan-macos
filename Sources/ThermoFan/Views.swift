@@ -8,21 +8,26 @@ struct MenuBarLabel: View {
         Array(store.menuSensors.prefix(3))
     }
 
+    /// Keep the NSStatusItem width stable while the first asynchronous hardware
+    /// sample is arriving. Resizing the status item while its window is opening
+    /// can make macOS immediately dismiss the window on the first click.
+    private var sensorSlotCount: Int {
+        min(3, max(1, store.preferences.menuSensorIDs.count))
+    }
+
     var body: some View {
         HStack(spacing: 5) {
             Image(systemName: "fan.fill")
-            if displayedSensors.isEmpty {
-                Text("--")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-            } else {
-                ForEach(Array(displayedSensors.enumerated()), id: \.element.id) { offset, sensor in
-                    if offset > 0 {
-                        Text("·").foregroundStyle(.secondary)
-                    }
-                    Text(store.preferences.temperatureUnit.format(sensor.temperatureC))
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .opacity(store.isSensorFresh(sensor) ? 1 : 0.55)
+            ForEach(0..<sensorSlotCount, id: \.self) { offset in
+                if offset > 0 {
+                    Text("·").foregroundStyle(.secondary)
                 }
+                let sensor = displayedSensors.indices.contains(offset) ? displayedSensors[offset] : nil
+                Text(sensor.map { store.preferences.temperatureUnit.format($0.temperatureC) } ?? "--")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .frame(width: 42, alignment: .trailing)
+                    .opacity(sensor.map { store.isSensorFresh($0) } ?? true ? 1 : 0.55)
             }
         }
         .accessibilityElement(children: .combine)
@@ -1340,23 +1345,48 @@ struct CurveEditor: View {
 
     private func temperatureField(for point: FanCurvePoint) -> some View {
         let unit = store.preferences.temperatureUnit
-        return TextField(unit.degreeLabel, value: Binding<Double>(
-            get: { unit.toDisplay(point.temperatureC) },
-            set: { store.updateCurvePoint(fanID: fan.id, pointID: point.id, temperature: unit.toCelsius($0)) }
-        ), format: .number.precision(.fractionLength(0)))
-        .textFieldStyle(.roundedBorder)
-        .multilineTextAlignment(.trailing)
-        .monospacedDigit()
+        return CurveNumberField(
+            placeholder: unit.degreeLabel,
+            value: formattedTemperature(unit.toDisplay(point.temperatureC))
+        ) { input in
+            guard let value = parseNumber(input), value.isFinite else { return nil }
+            store.updateCurvePoint(
+                fanID: fan.id,
+                pointID: point.id,
+                temperature: unit.toCelsius(value)
+            )
+            guard let updated = store.fans
+                .first(where: { $0.id == fan.id })?
+                .curve.first(where: { $0.id == point.id }) else { return nil }
+            return formattedTemperature(unit.toDisplay(updated.temperatureC))
+        }
     }
 
     private func rpmField(for point: FanCurvePoint) -> some View {
-        TextField("RPM", value: Binding<Int>(
-            get: { point.rpm },
-            set: { store.updateCurvePoint(fanID: fan.id, pointID: point.id, rpm: $0) }
-        ), format: .number)
-        .textFieldStyle(.roundedBorder)
-        .multilineTextAlignment(.trailing)
-        .monospacedDigit()
+        CurveNumberField(placeholder: "RPM", value: String(point.rpm)) { input in
+            guard let value = parseNumber(input), value.isFinite else { return nil }
+            let clampedValue = min(Double(fan.maxRPM), max(Double(fan.minRPM), value))
+            store.updateCurvePoint(
+                fanID: fan.id,
+                pointID: point.id,
+                rpm: Int(clampedValue.rounded())
+            )
+            guard let updated = store.fans
+                .first(where: { $0.id == fan.id })?
+                .curve.first(where: { $0.id == point.id }) else { return nil }
+            return String(updated.rpm)
+        }
+    }
+
+    private func parseNumber(_ input: String) -> Double? {
+        Double(input.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: "."))
+    }
+
+    private func formattedTemperature(_ value: Double) -> String {
+        if abs(value.rounded() - value) < 0.05 {
+            return String(Int(value.rounded()))
+        }
+        return String(format: "%.1f", value)
     }
 
     private func removePointButton(_ point: FanCurvePoint) -> some View {
@@ -1367,6 +1397,57 @@ struct CurveEditor: View {
         }
         .buttonStyle(.borderless)
         .disabled(fan.curve.count <= 2)
+    }
+}
+
+/// A numeric field with a local text draft. SwiftUI's value-based TextField
+/// writes through on every keystroke, so deleting the old number briefly
+/// produces an invalid value and the model immediately restores it. Keeping a
+/// draft lets people clear, replace, and correct the whole value naturally;
+/// validation happens only on Return or when focus leaves the field.
+private struct CurveNumberField: View {
+    let placeholder: String
+    let value: String
+    let onCommit: (String) -> String?
+
+    @State private var draft = ""
+    @State private var lastCommittedValue = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        TextField(placeholder, text: $draft)
+            .textFieldStyle(.roundedBorder)
+            .multilineTextAlignment(.trailing)
+            .monospacedDigit()
+            .focused($isFocused)
+            .onAppear {
+                draft = value
+                lastCommittedValue = value
+            }
+            .onChange(of: value) { _, newValue in
+                if !isFocused {
+                    draft = newValue
+                    lastCommittedValue = newValue
+                }
+            }
+            .onSubmit(commitDraft)
+            .onChange(of: isFocused) { wasFocused, focused in
+                if wasFocused && !focused {
+                    commitDraft()
+                }
+            }
+    }
+
+    private func commitDraft() {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != lastCommittedValue else { return }
+        guard !trimmed.isEmpty, let committed = onCommit(trimmed) else {
+            draft = value
+            lastCommittedValue = value
+            return
+        }
+        draft = committed
+        lastCommittedValue = committed
     }
 }
 

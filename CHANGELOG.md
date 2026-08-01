@@ -7,6 +7,15 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- The menu bar panel no longer dismisses itself when the first hardware sample
+  changes the status-item readout just as the panel opens.
+- Curve temperature and RPM fields can now be cleared, replaced, and corrected
+  before validation, including comma-decimal temperature input.
+- Committing a curve value with Return no longer writes the same value again
+  when the field later loses focus.
+
 ## [0.2.5] - 2026-07-29
 
 ### Fixed
