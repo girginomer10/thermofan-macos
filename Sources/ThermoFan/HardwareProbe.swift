@@ -613,7 +613,7 @@ final class HardwareProbe: @unchecked Sendable {
             ))
         }
 
-        return readings
+        return SensorContinuity.removingFlatPerformanceCoreSentinels(from: readings)
     }
 
     private func readSMCFans() -> [FanDevice] {

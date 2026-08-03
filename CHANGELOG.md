@@ -9,6 +9,8 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ### Fixed
 
+- Apple Silicon performance-core rows that all report the known 40 C SMC
+  sentinel are now hidden instead of appearing as live per-core temperatures.
 - The menu bar panel no longer dismisses itself when the first hardware sample
   changes the status-item readout just as the panel opens.
 - Curve temperature and RPM fields can now be cleared, replaced, and corrected

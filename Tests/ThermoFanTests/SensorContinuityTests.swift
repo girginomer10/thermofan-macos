@@ -34,15 +34,37 @@ final class SensorContinuityTests: XCTestCase {
         XCTAssertFalse(SensorContinuity.isFresh(stale, now: now, refreshInterval: 1))
     }
 
+    func testFlatFortyDegreePerformanceCoreGroupIsRemoved() {
+        let sensors = [
+            sensor(id: "TCMb", name: "CPU Core Max", temperature: 67),
+            sensor(id: "Tp0G", name: "CPU Performance Core 1", temperature: 40),
+            sensor(id: "Tp0H", name: "CPU Performance Core 2", temperature: 40)
+        ]
+
+        let filtered = SensorContinuity.removingFlatPerformanceCoreSentinels(from: sensors)
+
+        XCTAssertEqual(filtered.map(\.id), ["TCMb"])
+    }
+
+    func testChangingPerformanceCoreGroupIsKept() {
+        let sensors = [
+            sensor(id: "Tp0G", name: "CPU Performance Core 1", temperature: 52),
+            sensor(id: "Tp0H", name: "CPU Performance Core 2", temperature: 58)
+        ]
+
+        XCTAssertEqual(SensorContinuity.removingFlatPerformanceCoreSentinels(from: sensors), sensors)
+    }
+
     private func sensor(
         id: String,
-        source: ReadingSource,
+        name: String? = nil,
+        source: ReadingSource = .smc,
         temperature: Double,
         updatedAt: Date = Date()
     ) -> ThermalSensor {
         ThermalSensor(
             id: id,
-            name: id,
+            name: name ?? id,
             category: .cpu,
             temperatureC: temperature,
             source: source,
