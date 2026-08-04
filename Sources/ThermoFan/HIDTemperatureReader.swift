@@ -77,12 +77,8 @@ final class HIDTemperatureReader: @unchecked Sendable {
             // makes the menu bar and fan curves report a false "hottest" sensor.
             guard !normalizedProduct.contains("tcal") else { continue }
 
-            var value = IOHIDEventGetFloatValue(event, eventFieldTemperature)
-            if value > 200 {
-                value -= 273.15
-            }
-
-            guard value.isFinite, value > -20, value < 130 else {
+            let rawValue = IOHIDEventGetFloatValue(event, eventFieldTemperature)
+            guard let value = HIDTemperaturePolicy.celsius(from: rawValue) else {
                 continue
             }
 
@@ -145,6 +141,18 @@ final class HIDTemperatureReader: @unchecked Sendable {
             return rawName.replacingOccurrences(of: "temp", with: "Temperature")
         }
         return "PMU \(rawName)"
+    }
+}
+
+/// Filters values returned by Apple's private HID temperature event stream.
+/// Some Apple Silicon PMU services expose unused `tdev` channels as -1 C or
+/// -2 C. Those are firmware sentinels, not physical temperature readings.
+enum HIDTemperaturePolicy {
+    static func celsius(from rawValue: Double) -> Double? {
+        guard rawValue.isFinite else { return nil }
+        let value = rawValue > 200 ? rawValue - 273.15 : rawValue
+        guard value >= 0, value < 130 else { return nil }
+        return value
     }
 }
 
