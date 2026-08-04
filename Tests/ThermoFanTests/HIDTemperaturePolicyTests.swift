@@ -21,4 +21,20 @@ final class HIDTemperaturePolicyTests: XCTestCase {
         XCTAssertNil(HIDTemperaturePolicy.celsius(from: .infinity))
         XCTAssertNil(HIDTemperaturePolicy.celsius(from: 403.15))
     }
+
+    func testAnonymousPMUDevicesUseHumanReadableSystemNames() {
+        XCTAssertEqual(
+            HIDTemperaturePolicy.displayName(for: "PMU tdev1"),
+            "System Temperature 1"
+        )
+        XCTAssertEqual(
+            HIDTemperaturePolicy.displayName(for: "pmu tdev5"),
+            "System Temperature 5"
+        )
+    }
+
+    func testKnownPMUNameHandlingIsPreserved() {
+        XCTAssertEqual(HIDTemperaturePolicy.displayName(for: "PMU tdie2"), "PMU Die 2")
+        XCTAssertEqual(HIDTemperaturePolicy.displayName(for: "PMU NAND temp"), "NAND Temperature")
+    }
 }

@@ -89,7 +89,7 @@ final class HIDTemperatureReader: @unchecked Sendable {
 
             readings.append(ThermalSensor(
                 id: id,
-                name: Self.displayName(for: product),
+                name: HIDTemperaturePolicy.displayName(for: product),
                 category: Self.category(for: normalizedProduct),
                 temperatureC: value,
                 source: .system,
@@ -128,20 +128,6 @@ final class HIDTemperatureReader: @unchecked Sendable {
         return .other
     }
 
-    private static func displayName(for product: String) -> String {
-        let rawName = product.replacingOccurrences(of: "PMU ", with: "")
-        let normalized = rawName.lowercased()
-        if normalized.hasPrefix("tdie") {
-            return "PMU Die \(rawName.dropFirst(4))"
-        }
-        if normalized.hasPrefix("tdev") {
-            return "PMU Device \(rawName.dropFirst(4))"
-        }
-        if normalized.contains("nand") {
-            return rawName.replacingOccurrences(of: "temp", with: "Temperature")
-        }
-        return "PMU \(rawName)"
-    }
 }
 
 /// Filters values returned by Apple's private HID temperature event stream.
@@ -153,6 +139,31 @@ enum HIDTemperaturePolicy {
         let value = rawValue > 200 ? rawValue - 273.15 : rawValue
         guard value >= 0, value < 130 else { return nil }
         return value
+    }
+
+    static func displayName(for product: String) -> String {
+        let rawName = product.lowercased().hasPrefix("pmu ")
+            ? String(product.dropFirst(4))
+            : product
+        let normalized = rawName.lowercased()
+        if normalized.hasPrefix("tdie") {
+            return numberedName(prefix: "PMU Die", suffix: rawName.dropFirst(4))
+        }
+        if normalized.hasPrefix("tdev") {
+            // Apple exposes these as anonymous, model-dependent HID channels.
+            // Keep them visible without leaking the cryptic `PMU Device` label
+            // or claiming that a number maps to a specific physical component.
+            return numberedName(prefix: "System Temperature", suffix: rawName.dropFirst(4))
+        }
+        if normalized.contains("nand") {
+            return rawName.replacingOccurrences(of: "temp", with: "Temperature")
+        }
+        return "PMU \(rawName)"
+    }
+
+    private static func numberedName(prefix: String, suffix: Substring) -> String {
+        let number = suffix.trimmingCharacters(in: .whitespacesAndNewlines)
+        return number.isEmpty ? prefix : "\(prefix) \(number)"
     }
 }
 

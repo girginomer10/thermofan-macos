@@ -19,3 +19,11 @@
 - Verified: `swift test` (15 passed), release build, app packaging, strict code-signature check, and `git diff --check` passed.
 - Memory: Negative anonymous PMU `tdev` values are invalid channels; do not relabel anonymous device numbers as specific components without model evidence.
 - Next: Confirm on the affected M2 MacBook that PMU Device 4/5 disappear while valid PMU readings remain.
+
+## 2026-08-04 - Codex
+
+- Task: Remove cryptic `PMU Device N` labels across Apple Silicon models.
+- Changed: Anonymous `tdev` channels now display as `System Temperature N`; raw product IDs remain stable for diagnostics and sensor identity.
+- Verified: `swift test` (17 passed), release build, app packaging, strict code-signature check, and `git diff --check` passed.
+- Memory: Apple HID `tdev` numbers are anonymous/model-dependent; use neutral names unless a model-specific mapping is hardware-verified.
+- Next: Confirm the friendlier labels on the affected M2 MacBook.
