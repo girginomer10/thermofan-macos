@@ -27,3 +27,20 @@
 - Verified: `swift test` (17 passed), release build, app packaging, strict code-signature check, and `git diff --check` passed.
 - Memory: Apple HID `tdev` numbers are anonymous/model-dependent; use neutral names unless a model-specific mapping is hardware-verified.
 - Next: Confirm the friendlier labels on the affected M2 MacBook.
+
+## 2026-08-12 00:54 +03 - Codex
+
+- Task: Fix ThermoFan consuming one full CPU core while its menu panel is open.
+- Changed: Removed the automatic-refresh fan-icon animation that kept SwiftUI
+  laying out the full panel for most of every one-second refresh cycle; updated
+  the changelog.
+- Verified: `swift test` (17 passed), clean release package, strict code-signature
+  verification, installed-binary hash match, and live one-second-refresh testing
+  with both panel and Settings open. CPU fell from about 99% to 3.2-8.2%; a
+  five-second sample showed the main thread idle for 4101/4309 samples and only
+  15 layout samples, versus 2868/3479 layout samples before the fix.
+- Memory: Automatic telemetry must not drive long-running whole-panel animations;
+  keep refresh indicators manual or isolated from the full SwiftUI hierarchy.
+- Next: None for this fix. Uncommitted sensor/GPU smoothing work in
+  `HardwareProbe.swift`, `SensorContinuity.swift`, and `ThermalStore.swift` was
+  deliberately excluded from the build and commit.

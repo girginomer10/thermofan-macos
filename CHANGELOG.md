@@ -9,6 +9,9 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ### Fixed
 
+- Automatic sensor refreshes no longer animate the menu-panel fan icon and
+  continuously drive SwiftUI layout work when the panel is open at a short
+  refresh interval.
 - Apple Silicon performance-core rows that all report the known 40 C SMC
   sentinel are now hidden instead of appearing as live per-core temperatures.
 - The menu bar panel no longer dismisses itself when the first hardware sample

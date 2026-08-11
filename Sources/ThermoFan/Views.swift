@@ -47,7 +47,6 @@ struct MenuBarLabel: View {
 
 struct StatusPanelView: View {
     @EnvironmentObject private var store: ThermalStore
-    @State private var spinAngle = 0.0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -78,12 +77,6 @@ struct StatusPanelView: View {
                 Image(systemName: "fan.fill")
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(thermalTint)
-                    .rotationEffect(.degrees(spinAngle))
-                    .onChange(of: store.isRefreshing) { _, refreshing in
-                        if refreshing {
-                            withAnimation(.easeInOut(duration: 0.7)) { spinAngle += 180 }
-                        }
-                    }
             }
 
             VStack(alignment: .leading, spacing: 3) {
