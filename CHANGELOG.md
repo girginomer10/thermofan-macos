@@ -9,6 +9,12 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ### Fixed
 
+- Closing Settings now releases its SwiftUI tab hierarchy instead of letting a
+  hidden window continue laying itself out on every sensor refresh, which could
+  eventually consume a full CPU core and make the menu panel slow to open.
+- Settings now builds only the selected page through a lightweight sidebar,
+  avoiding the native tab layout cycle and the initial cost of measuring every
+  settings page at once.
 - Automatic sensor refreshes no longer animate the menu-panel fan icon and
   continuously drive SwiftUI layout work when the panel is open at a short
   refresh interval.

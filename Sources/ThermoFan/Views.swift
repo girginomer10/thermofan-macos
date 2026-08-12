@@ -189,7 +189,9 @@ struct StatusPanelView: View {
 
             Spacer()
 
-            SettingsLink {
+            Button {
+                AppWindowBridge.showSettings?()
+            } label: {
                 Label("Preferences", systemImage: "slider.horizontal.3")
             }
 
@@ -219,32 +221,88 @@ struct StatusPanelView: View {
 }
 
 struct PreferencesView: View {
-    @EnvironmentObject private var store: ThermalStore
+    @State private var selectedSection = SettingsSection.general
 
     var body: some View {
-        TabView {
-            GeneralSettingsPane()
-                .tabItem { Label("General", systemImage: "gearshape") }
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(SettingsSection.allCases) { section in
+                    Button {
+                        selectedSection = section
+                    } label: {
+                        Label(section.title, systemImage: section.systemImage)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .foregroundStyle(selectedSection == section ? Color.accentColor : .primary)
+                    .background(
+                        selectedSection == section ? Color.accentColor.opacity(0.14) : .clear,
+                        in: RoundedRectangle(cornerRadius: 7)
+                    )
+                }
+                Spacer()
+            }
+            .frame(width: 150)
+            .padding(12)
 
-            SensorsSettingsPane()
-                .tabItem { Label("Sensors", systemImage: "sensor") }
+            Divider()
 
-            IndexesSettingsPane()
-                .tabItem { Label("Indexes", systemImage: "chart.line.uptrend.xyaxis") }
-
-            FansSettingsPane()
-                .tabItem { Label("Fans", systemImage: "fan") }
-
-            PresetsSettingsPane()
-                .tabItem { Label("Presets", systemImage: "dial.low") }
-
-            MenuBarSettingsPane()
-                .tabItem { Label("Menu Bar", systemImage: "menubar.rectangle") }
-
-            AboutSettingsPane()
-                .tabItem { Label("About", systemImage: "info.circle") }
+            selectedPane
+                .padding(18)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .padding(18)
+    }
+
+    @ViewBuilder
+    private var selectedPane: some View {
+        switch selectedSection {
+        case .general: GeneralSettingsPane()
+        case .sensors: SensorsSettingsPane()
+        case .indexes: IndexesSettingsPane()
+        case .fans: FansSettingsPane()
+        case .presets: PresetsSettingsPane()
+        case .menuBar: MenuBarSettingsPane()
+        case .about: AboutSettingsPane()
+        }
+    }
+
+    private enum SettingsSection: String, CaseIterable, Identifiable {
+        case general
+        case sensors
+        case indexes
+        case fans
+        case presets
+        case menuBar
+        case about
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .general: "General"
+            case .sensors: "Sensors"
+            case .indexes: "Indexes"
+            case .fans: "Fans"
+            case .presets: "Presets"
+            case .menuBar: "Menu Bar"
+            case .about: "About"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .general: "gearshape"
+            case .sensors: "sensor"
+            case .indexes: "chart.line.uptrend.xyaxis"
+            case .fans: "fan"
+            case .presets: "dial.low"
+            case .menuBar: "menubar.rectangle"
+            case .about: "info.circle"
+            }
+        }
     }
 }
 

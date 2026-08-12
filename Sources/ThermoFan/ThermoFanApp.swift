@@ -21,17 +21,16 @@ struct ThermoFanApp: App {
                 .environmentObject(store)
         }
         .menuBarExtraStyle(.window)
-
-        Settings {
-            PreferencesView()
-                .environmentObject(store)
-                .frame(minWidth: 820, minHeight: 560)
-        }
     }
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+enum AppWindowBridge {
+    static var showSettings: (() -> Void)?
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var settingsWindowController: NSWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -41,6 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 store.applyActivationPolicy()
             } else {
                 NSApp.setActivationPolicy(.accessory)
+            }
+
+            AppWindowBridge.showSettings = { [weak self] in
+                self?.showSettings()
             }
 
             if CommandLine.arguments.contains("--open-settings") {
@@ -67,6 +70,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        AppWindowBridge.showSettings = nil
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard
+            let window = notification.object as? NSWindow,
+            window === settingsWindowController?.window
+        else { return }
+
+        // A hidden NSHostingController keeps observing the rapidly changing
+        // sensor store. Release the entire SwiftUI view graph when Settings
+        // closes so its tab layout cannot continue consuming CPU off-screen.
+        window.contentViewController = nil
+        settingsWindowController = nil
+    }
+
     private func showSettings() {
         if let window = settingsWindowController?.window {
             window.makeKeyAndOrderFront(nil)
@@ -83,7 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.setContentSize(NSSize(width: 900, height: 640))
         window.center()
-        window.isReleasedWhenClosed = false
+        window.isReleasedWhenClosed = true
+        window.delegate = self
         settingsWindowController = NSWindowController(window: window)
 
         window.makeKeyAndOrderFront(nil)

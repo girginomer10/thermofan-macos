@@ -44,3 +44,23 @@
 - Next: None for this fix. Uncommitted sensor/GPU smoothing work in
   `HardwareProbe.swift`, `SensorContinuity.swift`, and `ThermalStore.swift` was
   deliberately excluded from the build and commit.
+
+## 2026-08-12 13:44 +03 - Codex
+
+- Task: Fix the remaining menu-panel lag and long-running CPU/memory growth.
+- Changed: Removed the duplicate SwiftUI `Settings` scene, routed every Settings
+  entry through one managed window, released its hosting view/controller on
+  close, and replaced the native seven-page `TabView` with a lightweight sidebar
+  that builds only the selected page.
+- Verified: `swift test` (17 passed), clean release package, strict signature and
+  installed-binary hash checks, 10 Settings open/close cycles (window count
+  returned from 1 to 0 every time), a post-close sample with no `AppKitTabView`
+  or `SystemSegmentedControl` stacks, and a live first-10-seconds menu-panel test
+  at 1.9-5.3% CPU.
+- Memory: A closed `NSHostingController` must not stay subscribed to the live
+  sensor store. On macOS 26, retaining the native Settings `TabView` caused an
+  off-screen layout loop that grew to about 99% CPU, 1.3 GB physical footprint,
+  and 7.2 million allocations after roughly 12 hours.
+- Next: Watch long-running installed-app CPU and memory, but the retained-window
+  and native-tab paths responsible for the reproduced loop are gone. Existing
+  uncommitted sensor/GPU smoothing work remains excluded.
