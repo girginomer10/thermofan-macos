@@ -12,25 +12,37 @@ enum SensorContinuity {
             merged.append(sensor)
             sensorIDs.insert(sensor.id)
         }
-        return removingFlatPerformanceCoreSentinels(from: merged)
+        return removingFlatCoreSentinels(from: merged)
     }
 
     /// Some Apple Silicon SMC firmwares expose the legacy `Tp0*` performance
     /// keys but return 40 C for every key, even while the CPU hotspot changes.
     /// That is a sentinel, not per-core telemetry. Hide the entire group rather
     /// than presenting it as a real, current measurement.
-    static func removingFlatPerformanceCoreSentinels(from sensors: [ThermalSensor]) -> [ThermalSensor] {
-        let performanceCores = sensors.filter {
+    static func removingFlatCoreSentinels(from sensors: [ThermalSensor]) -> [ThermalSensor] {
+        var result = sensors
+
+        let performanceCores = result.filter {
             $0.name.localizedCaseInsensitiveContains("Performance Core")
         }
-        guard performanceCores.count >= 2,
-              performanceCores.allSatisfy({ abs($0.temperatureC - 40) < 0.01 })
-        else {
-            return sensors
+        if performanceCores.count >= 2,
+           performanceCores.allSatisfy({ abs($0.temperatureC - 40) < 0.01 })
+        {
+            let sentinelIDs = Set(performanceCores.map(\.id))
+            result = result.filter { !sentinelIDs.contains($0.id) }
         }
 
-        let sentinelIDs = Set(performanceCores.map(\.id))
-        return sensors.filter { !sentinelIDs.contains($0.id) }
+        let gpuCores = result.filter {
+            $0.name.localizedCaseInsensitiveContains("GPU Core")
+        }
+        if gpuCores.count >= 2,
+           gpuCores.allSatisfy({ abs($0.temperatureC - 40) < 0.01 })
+        {
+            let sentinelIDs = Set(gpuCores.map(\.id))
+            result = result.filter { !sentinelIDs.contains($0.id) }
+        }
+
+        return result
     }
 
     static func isFresh(

@@ -64,3 +64,21 @@
 - Next: Watch long-running installed-app CPU and memory, but the retained-window
   and native-tab paths responsible for the reproduced loop are gone. Existing
   uncommitted sensor/GPU smoothing work remains excluded.
+
+## 2026-08-12 14:55 +03 - Codex
+
+- Task: Finish, commit, and install the pending GPU sensor and menu-temperature
+  smoothing work.
+- Changed: Added Apple Silicon GPU-core SMC candidates, generalized flat 40 C
+  core-sentinel filtering to CPU and GPU groups, and added a bounded three-sample
+  median for menu-bar/hottest-sensor selection. Added focused tests and pruned
+  histories for sensors that disappear.
+- Verified: `swift test` (22 passed), release packaging, strict signatures,
+  installed-binary hash match, three installed-app hardware diagnostics, and a
+  live menu-panel test. The four newly surfaced GPU readings changed plausibly
+  across samples; panel-open CPU stayed at 3.0-8.9% after the first idle sample.
+- Memory: On the Mac16,11 M4 Pro, `Tg0d`, `Tg0e`, `Tg1c`, and `Tg1d` returned
+  changing plausible GPU readings; absent candidates are ignored. Uniform 40 C
+  GPU-core groups should be treated as firmware sentinels without suppressing
+  unrelated GPU cluster or hotspot readings.
+- Next: None.

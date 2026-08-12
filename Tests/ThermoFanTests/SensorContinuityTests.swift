@@ -41,7 +41,7 @@ final class SensorContinuityTests: XCTestCase {
             sensor(id: "Tp0H", name: "CPU Performance Core 2", temperature: 40)
         ]
 
-        let filtered = SensorContinuity.removingFlatPerformanceCoreSentinels(from: sensors)
+        let filtered = SensorContinuity.removingFlatCoreSentinels(from: sensors)
 
         XCTAssertEqual(filtered.map(\.id), ["TCMb"])
     }
@@ -52,12 +52,34 @@ final class SensorContinuityTests: XCTestCase {
             sensor(id: "Tp0H", name: "CPU Performance Core 2", temperature: 58)
         ]
 
-        XCTAssertEqual(SensorContinuity.removingFlatPerformanceCoreSentinels(from: sensors), sensors)
+        XCTAssertEqual(SensorContinuity.removingFlatCoreSentinels(from: sensors), sensors)
+    }
+
+    func testFlatFortyDegreeGPUCoreGroupIsRemovedWithoutRemovingOtherGPUReadings() {
+        let sensors = [
+            sensor(id: "TRDX", name: "GPU Die Hotspot", category: .gpu, temperature: 57),
+            sensor(id: "Tg0d", name: "GPU Core 4", category: .gpu, temperature: 40),
+            sensor(id: "Tg0e", name: "GPU Core 5", category: .gpu, temperature: 40)
+        ]
+
+        let filtered = SensorContinuity.removingFlatCoreSentinels(from: sensors)
+
+        XCTAssertEqual(filtered.map(\.id), ["TRDX"])
+    }
+
+    func testChangingGPUCoreGroupIsKept() {
+        let sensors = [
+            sensor(id: "Tg0d", name: "GPU Core 4", category: .gpu, temperature: 48.5),
+            sensor(id: "Tg0e", name: "GPU Core 5", category: .gpu, temperature: 51.25)
+        ]
+
+        XCTAssertEqual(SensorContinuity.removingFlatCoreSentinels(from: sensors), sensors)
     }
 
     private func sensor(
         id: String,
         name: String? = nil,
+        category: SensorCategory = .cpu,
         source: ReadingSource = .smc,
         temperature: Double,
         updatedAt: Date = Date()
@@ -65,7 +87,7 @@ final class SensorContinuityTests: XCTestCase {
         ThermalSensor(
             id: id,
             name: name ?? id,
-            category: .cpu,
+            category: category,
             temperatureC: temperature,
             source: source,
             isFavorite: false,

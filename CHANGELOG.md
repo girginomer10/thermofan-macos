@@ -9,6 +9,10 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ### Fixed
 
+- Menu-bar temperatures now use a short median window so a single transient SMC
+  spike does not flash as the current hottest reading.
+- Uniform 40 C GPU-core firmware sentinels are hidden while changing GPU-core
+  readings remain visible.
 - Closing Settings now releases its SwiftUI tab hierarchy instead of letting a
   hidden window continue laying itself out on every sensor refresh, which could
   eventually consume a full CPU core and make the menu panel slow to open.

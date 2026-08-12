@@ -552,6 +552,30 @@ final class HardwareProbe: @unchecked Sendable {
             SensorDefinition(key: "Tg0Y", name: "GPU Cluster 3", category: .gpu),
             SensorDefinition(key: "Tg0k", name: "GPU Cluster 4", category: .gpu),
             SensorDefinition(key: "Tg0z", name: "GPU Cluster 5", category: .gpu),
+            SensorDefinition(key: "Tg0a", name: "GPU Core 1", category: .gpu),
+            SensorDefinition(key: "Tg0b", name: "GPU Core 2", category: .gpu),
+            SensorDefinition(key: "Tg0c", name: "GPU Core 3", category: .gpu),
+            SensorDefinition(key: "Tg0d", name: "GPU Core 4", category: .gpu),
+            SensorDefinition(key: "Tg0e", name: "GPU Core 5", category: .gpu),
+            SensorDefinition(key: "Tg0f", name: "GPU Core 6", category: .gpu),
+            SensorDefinition(key: "Tg0g", name: "GPU Core 7", category: .gpu),
+            SensorDefinition(key: "Tg0h", name: "GPU Core 8", category: .gpu),
+            SensorDefinition(key: "Tg1a", name: "GPU Core 9", category: .gpu),
+            SensorDefinition(key: "Tg1b", name: "GPU Core 10", category: .gpu),
+            SensorDefinition(key: "Tg1c", name: "GPU Core 11", category: .gpu),
+            SensorDefinition(key: "Tg1d", name: "GPU Core 12", category: .gpu),
+            SensorDefinition(key: "Tg1e", name: "GPU Core 13", category: .gpu),
+            SensorDefinition(key: "Tg1f", name: "GPU Core 14", category: .gpu),
+            SensorDefinition(key: "Tg1g", name: "GPU Core 15", category: .gpu),
+            SensorDefinition(key: "Tg1h", name: "GPU Core 16", category: .gpu),
+            SensorDefinition(key: "Tg2a", name: "GPU Core 17", category: .gpu),
+            SensorDefinition(key: "Tg2b", name: "GPU Core 18", category: .gpu),
+            SensorDefinition(key: "Tg2c", name: "GPU Core 19", category: .gpu),
+            SensorDefinition(key: "Tg2d", name: "GPU Core 20", category: .gpu),
+            SensorDefinition(key: "Tg2e", name: "GPU Core 21", category: .gpu),
+            SensorDefinition(key: "Tg2f", name: "GPU Core 22", category: .gpu),
+            SensorDefinition(key: "Tg2g", name: "GPU Core 23", category: .gpu),
+            SensorDefinition(key: "Tg2h", name: "GPU Core 24", category: .gpu),
             SensorDefinition(key: "TRDX", name: "GPU Die Hotspot", category: .gpu),
             SensorDefinition(key: "TPMP", name: "SoC Package", category: .power),
             SensorDefinition(key: "TPDX", name: "SoC Package Hotspot", category: .power),
@@ -613,7 +637,7 @@ final class HardwareProbe: @unchecked Sendable {
             ))
         }
 
-        return SensorContinuity.removingFlatPerformanceCoreSentinels(from: readings)
+        return SensorContinuity.removingFlatCoreSentinels(from: readings)
     }
 
     private func readSMCFans() -> [FanDevice] {

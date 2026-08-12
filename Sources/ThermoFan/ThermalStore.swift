@@ -49,6 +49,11 @@ final class ThermalStore: ObservableObject {
     /// control loop so it only re-applies when the target moves meaningfully.
     private var lastAppliedRPM: [String: Int] = [:]
     private static let curveHysteresisRPM = 100
+    /// Ring buffer of recent temperature readings per sensor (max 3). Used to
+    /// compute a median for the menu bar display, preventing transient SMC
+    /// spikes from flashing a misleading value in the status bar.
+    private var recentReadings: [String: [Double]] = [:]
+    private static let medianWindowSize = 3
 
     var helperInstalled: Bool {
         helperState.isUsable
@@ -88,16 +93,25 @@ final class ThermalStore: ObservableObject {
     var hottestSensor: ThermalSensor? {
         let freshSensors = unhiddenSensors.filter { isSensorFresh($0) }
         return (freshSensors.isEmpty ? unhiddenSensors : freshSensors)
-            .max { $0.temperatureC < $1.temperatureC }
+            .max { smoothedTemperature($0) < smoothedTemperature($1) }
     }
 
     var menuSensors: [ThermalSensor] {
         let ids = preferences.menuSensorIDs
+        let raw: [ThermalSensor]
         if ids.isEmpty {
-            return hottestSensor.map { [$0] } ?? []
+            raw = hottestSensor.map { [$0] } ?? []
+        } else {
+            let lookup = Dictionary(uniqueKeysWithValues: sensors.map { ($0.id, $0) })
+            raw = ids.compactMap { lookup[$0] }.filter { !$0.isHidden }
         }
-        let lookup = Dictionary(uniqueKeysWithValues: sensors.map { ($0.id, $0) })
-        return ids.compactMap { lookup[$0] }.filter { !$0.isHidden }
+        // Replace the raw temperature with the median-smoothed value so the
+        // menu bar doesn't flash a transient spike.
+        return raw.map { sensor in
+            var smoothed = sensor
+            smoothed.temperatureC = smoothedTemperature(sensor)
+            return smoothed
+        }
     }
 
     var curveSourceSensors: [ThermalSensor] {
@@ -197,6 +211,7 @@ final class ThermalStore: ObservableObject {
             previous: sensors
         )
         sensors = mergeSensors(addIndexes(to: continuousSensors))
+        updateRecentReadings()
         // Keep the last-known fan configuration if a sample momentarily returns
         // no fans (transient SMC read failure) so hand-tuned curves aren't wiped.
         if !snapshot.fans.isEmpty {
@@ -1126,5 +1141,46 @@ final class ThermalStore: ObservableObject {
 
     private func clamp(_ value: Int, min minimum: Int, max maximum: Int) -> Int {
         Swift.max(minimum, Swift.min(maximum, value))
+    }
+
+    // MARK: - Median smoothing for menu bar
+
+    /// Appends the current temperature of every sensor to the ring buffer.
+    private func updateRecentReadings() {
+        let activeSensorIDs = Set(sensors.map(\.id))
+        recentReadings = recentReadings.filter { activeSensorIDs.contains($0.key) }
+        for sensor in sensors {
+            recentReadings[sensor.id] = TemperatureSmoothing.appending(
+                sensor.temperatureC,
+                to: recentReadings[sensor.id] ?? [],
+                maximumCount: Self.medianWindowSize
+            )
+        }
+    }
+
+    /// Returns the median of the last few readings for a sensor, falling back
+    /// to the raw value when no history is available yet.
+    private func smoothedTemperature(_ sensor: ThermalSensor) -> Double {
+        TemperatureSmoothing.median(
+            recentReadings[sensor.id] ?? [],
+            fallback: sensor.temperatureC
+        )
+    }
+}
+
+enum TemperatureSmoothing {
+    static func appending(_ reading: Double, to history: [Double], maximumCount: Int) -> [Double] {
+        guard maximumCount > 0 else { return [] }
+        return Array((history + [reading]).suffix(maximumCount))
+    }
+
+    static func median(_ readings: [Double], fallback: Double) -> Double {
+        guard !readings.isEmpty else { return fallback }
+        let sorted = readings.sorted()
+        let middle = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        return sorted[middle]
     }
 }
