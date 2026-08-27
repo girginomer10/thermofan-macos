@@ -197,34 +197,6 @@ final class HardwareCompatibilityTests: XCTestCase {
         XCTAssertEqual(snapshot.warnings.count, 1)
     }
 
-    func testHelperRecoveryExitIsNotCollapsedIntoOrdinaryFailure() {
-        let error = FanControlService.classifyProcessFailure(
-            status: FanControlService.recoveryRequiredExitCode,
-            output: "",
-            errorOutput: "rollback could not be verified",
-            recoveryExitCode: FanControlService.recoveryRequiredExitCode
-        )
-
-        guard case .recoveryRequired(let message) = error else {
-            return XCTFail("Expected recovery-required helper result")
-        }
-        XCTAssertEqual(message, "rollback could not be verified")
-    }
-
-    func testOrdinaryHelperFailureRemainsOrdinaryFailure() {
-        let error = FanControlService.classifyProcessFailure(
-            status: 1,
-            output: "",
-            errorOutput: "mode key missing",
-            recoveryExitCode: FanControlService.recoveryRequiredExitCode
-        )
-
-        guard case .processFailed(let message) = error else {
-            return XCTFail("Expected ordinary helper failure")
-        }
-        XCTAssertEqual(message, "mode key missing")
-    }
-
     func testUnownedAutoFailureDoesNotPromiseWatchdogRecovery() {
         let status = thermofan_status_after_persisted_ownership_check(
             1,

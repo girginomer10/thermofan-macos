@@ -10,8 +10,6 @@ enum CommandLineEntrypoint {
         case "--diagnose":
             runDiagnostics()
             exit(0)
-        case "--fanctl":
-            exit(runFanControl(arguments: Array(arguments.dropFirst())))
         default:
             return
         }
@@ -146,68 +144,11 @@ enum CommandLineEntrypoint {
             || lower.contains("f1")
     }
 
-    private static func runFanControl(arguments: [String]) -> Int32 {
-        guard arguments.count >= 2 else {
-            writeError("Usage: ThermoFan --fanctl <fan-index> automatic")
-            return 64
-        }
-
-        guard let fanIndex = Int(arguments[0]) else {
-            writeError("Invalid fan index '\(arguments[0])'.")
-            return 64
-        }
-
-        guard let mode = parseMode(arguments[1]) else {
-            writeError("Invalid fan mode '\(arguments[1])'.")
-            return 64
-        }
-        guard mode == .automatic else {
-            writeError(
-                "Fixed and curve one-shot commands are disabled because they cannot guarantee a verified crash watchdog. Use the ThermoFan app instead."
-            )
-            return 64
-        }
-        guard arguments.count == 2 else {
-            writeError("Automatic mode does not accept an RPM or extra arguments.")
-            return 64
-        }
-
-        switch FanControlService().applyCommandWithPersistentHelper(fanIndex: fanIndex, mode: mode, rpm: nil) {
-        case .applied(let message):
-            print(message)
-            return 0
-        case .failed(let message):
-            writeError(message)
-            return 1
-        case .recoveryRequired(let message):
-            writeError(message)
-            return 75
-        }
-    }
-
-    private static func parseMode(_ value: String) -> FanMode? {
-        switch value.lowercased() {
-        case "auto", "automatic":
-            return .automatic
-        case "fixed":
-            return .fixed
-        case "curve":
-            return .curve
-        default:
-            return nil
-        }
-    }
-
     private static func describe(_ error: Error) -> String {
         if let localized = error as? LocalizedError, let description = localized.errorDescription {
             return description
         }
         return String(describing: error)
-    }
-
-    private static func writeError(_ message: String) {
-        let data = Data((message + "\n").utf8)
-        FileHandle.standardError.write(data)
     }
 
     private static func hex(_ bytes: [UInt8]) -> String {

@@ -17,15 +17,11 @@ final class FanControlService: @unchecked Sendable {
 
     enum FanControlError: Error, LocalizedError {
         case invalidFanIdentifier(String)
-        case helperMissing
-        case recoveryRequired(String)
         case processFailed(String)
 
         var errorDescription: String? {
             switch self {
             case .invalidFanIdentifier(let id): "Invalid fan identifier '\(id)'."
-            case .helperMissing: "The authenticated Hardware Helper is not ready."
-            case .recoveryRequired(let message): message
             case .processFailed(let message): message
             }
         }
@@ -91,34 +87,8 @@ final class FanControlService: @unchecked Sendable {
         return map(client.apply(fanIndex: fanIndex, mode: mode, rpm: rpm))
     }
 
-    func applyCommandWithPersistentHelper(fanIndex: Int, mode: FanMode, rpm: Int?) -> ApplyResult {
-        guard mode == .automatic, rpm == nil else {
-            return .failed(
-                "Fixed and curve one-shot commands are disabled because a command-line process cannot maintain the authenticated watchdog lease. Use the ThermoFan app instead."
-            )
-        }
-        return map(client.apply(fanIndex: fanIndex, mode: .automatic, rpm: nil))
-    }
-
     func returnAllToAutomatic() -> ApplyResult {
         map(client.returnAllToAutomatic())
-    }
-
-    static func classifyProcessFailure(
-        status: Int32,
-        output: String,
-        errorOutput: String,
-        recoveryExitCode: Int32?
-    ) -> FanControlError {
-        let message = errorOutput.isEmpty ? output : errorOutput
-        if let recoveryExitCode, status == recoveryExitCode {
-            return .recoveryRequired(
-                message.isEmpty
-                    ? "Automatic fan recovery could not be verified."
-                    : message
-            )
-        }
-        return .processFailed(message)
     }
 
     private func map(_ result: PrivilegedFanClient.Result) -> ApplyResult {

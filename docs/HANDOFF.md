@@ -119,8 +119,11 @@
   covers arm64 macOS 14, 15, and 26, pins third-party actions by commit, and
   exposes the aggregate `Build and test` result required by branch protection;
   the macOS 14 runner explicitly selects its installed Swift 6 toolchain, and
-  the shared source avoids SDK/import patterns rejected by Swift 6.0.
-- Verified: `swift test` (54 passed), production app/helper build, strict Swift/C
+  the shared source avoids SDK/import patterns rejected by Swift 6.0. Removed
+  the last Auto-only `--fanctl` entry point and made CI fail explicitly if a
+  forbidden legacy command marker remains in either release binary.
+- Verified: `swift test` (52 passed after deleting two obsolete CLI-process
+  classification tests), production app/helper build, strict Swift/C
   warning and analyzer checks, strict app/helper code-signature checks,
   Hardened Runtime, arm64-only binaries, macOS 14 deployment targets, mode
   `0755` with no setuid/setgid files, exact LaunchDaemon metadata, absence of
