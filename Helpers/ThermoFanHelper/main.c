@@ -3,10 +3,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libproc.h>
+#include <limits.h>
 #include <math.h>
 #include <mach/mach_error.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,23 +19,28 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ThermoFanEngine.h"
 #include "ThermoFanSafetyPolicy.h"
 
 #define SMC_KERNEL_INDEX 2
 #define SMC_READ_BYTES 5
 #define SMC_WRITE_BYTES 6
 #define SMC_READ_KEY_INFO 9
-#define HELPER_VERSION "8"
+#define THERMOFAN_STRINGIFY_INNER(value) #value
+#define THERMOFAN_STRINGIFY(value) THERMOFAN_STRINGIFY_INNER(value)
+#define HELPER_VERSION THERMOFAN_STRINGIFY(THERMOFAN_ENGINE_PROTOCOL_VERSION)
+#define FAN_STATE_DIRECTORY "/var/run"
+#define FAN_STATE_DIRECTORY_GROUP 1
+#define FAN_STATE_BASENAME "io.github.girginomer10.ThermoFan.fan.state"
 #define FAN_LOCK_PATH "/var/run/io.github.girginomer10.ThermoFan.fan.lock"
-#define FAN_STATE_PATH "/var/run/io.github.girginomer10.ThermoFan.fan.state"
 #define FAN_STATE_MAGIC 0x54464638u
 #define FAN_STATE_VERSION 2u
 #define FAN_STATE_FTST_OWNED 0x1u
 #define FAN_STATE_ALLOWED_FLAGS FAN_STATE_FTST_OWNED
 #define FAN_STATE_MAX_FANS 8
 #define FAN_SAFE_MAX_RPM 20000
-#define EXIT_RECOVERY_REQUIRED 75
-#define WATCHDOG_READY_FORMAT "THERMOFAN_WATCHDOG_READY_V8 pid=%d fan=%d\n"
+#define EXIT_RECOVERY_REQUIRED THERMOFAN_ENGINE_RECOVERY_REQUIRED
+#define STATE_TEMP_ATTEMPTS 32
 
 typedef struct {
     uint8_t major;
@@ -356,11 +363,7 @@ typedef struct {
     char mode_key[5];
 } FanControlEndpoint;
 
-typedef struct {
-    int32_t pid;
-    uint64_t start_seconds;
-    uint64_t start_microseconds;
-} ProcessIdentity;
+typedef ThermoFanProcessIdentity ProcessIdentity;
 
 typedef struct {
     uint32_t magic;
@@ -374,6 +377,9 @@ typedef struct {
     uint32_t flags;
     uint32_t checksum;
 } FanControlState;
+
+static _Atomic int startup_recovery_succeeded = 0;
+static _Atomic int manual_writes_ready = 0;
 
 static int is_apple_silicon_build(void) {
 #if defined(__arm64__) || defined(__aarch64__)
@@ -406,7 +412,7 @@ static uint32_t fan_state_checksum(const FanControlState *state) {
     return hash;
 }
 
-static int read_process_identity(pid_t pid, ProcessIdentity *identity) {
+int thermofan_engine_read_process_identity(pid_t pid, ProcessIdentity *identity) {
     if (pid <= 1 || identity == NULL) {
         return 1;
     }
@@ -455,7 +461,7 @@ static int process_identity_is_current(const ProcessIdentity *identity) {
         return 0;
     }
     ProcessIdentity current;
-    return read_process_identity((pid_t)identity->pid, &current) == 0
+    return thermofan_engine_read_process_identity((pid_t)identity->pid, &current) == 0
         && thermofan_process_identity_matches(
             identity->pid,
             identity->start_seconds,
@@ -516,6 +522,7 @@ static int open_root_owned_file(const char *path) {
     if (fstat(descriptor, &attributes) != 0
         || !S_ISREG(attributes.st_mode)
         || attributes.st_uid != 0
+        || attributes.st_nlink != 1
         || (attributes.st_mode & 077) != 0) {
         fprintf(stderr, "Privileged fan state at %s has unsafe ownership or permissions.\n", path);
         close(descriptor);
@@ -529,15 +536,101 @@ static int open_root_owned_file(const char *path) {
     return descriptor;
 }
 
-// Returns 2 for a valid v1 state requiring fail-safe Auto migration, 1 for a
-// current state, 0 for an empty state, and -1 for malformed state.
-static int load_fan_state(int state_fd, FanControlState *state) {
-    struct stat attributes;
-    if (fstat(state_fd, &attributes) != 0) {
+static int open_state_directory(void) {
+    int descriptor = open(FAN_STATE_DIRECTORY, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptor < 0) {
+        fprintf(stderr, "Could not open privileged state directory: %s.\n", strerror(errno));
         return -1;
     }
+
+    // Darwin's /private/var/run is intentionally root:daemon (gid 1), 0775.
+    // Reject every other writable parent shape while accepting that system
+    // directory; state objects themselves remain root-only and no-follow.
+    struct stat attributes;
+    if (fstat(descriptor, &attributes) != 0
+        || !S_ISDIR(attributes.st_mode)
+        || attributes.st_uid != 0
+        || (attributes.st_mode & 0002) != 0
+        || ((attributes.st_mode & 0020) != 0
+            && attributes.st_gid != FAN_STATE_DIRECTORY_GROUP)) {
+        fprintf(stderr, "Privileged state directory has unsafe ownership or permissions.\n");
+        close(descriptor);
+        return -1;
+    }
+    return descriptor;
+}
+
+// Returns 1 when a safe state file exists, 0 when absent, and -1 when the
+// expected path is occupied by an unsafe object.
+static int validate_state_path(int directory_fd, struct stat *attributes) {
+    struct stat local_attributes;
+    if (attributes == NULL) {
+        attributes = &local_attributes;
+    }
+    if (fstatat(
+            directory_fd,
+            FAN_STATE_BASENAME,
+            attributes,
+            AT_SYMLINK_NOFOLLOW
+        ) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (!S_ISREG(attributes->st_mode)
+        || attributes->st_uid != 0
+        || attributes->st_nlink != 1
+        || (attributes->st_mode & 077) != 0) {
+        return -1;
+    }
+    return 1;
+}
+
+// Returns 2 for a valid v1 state requiring fail-safe Auto migration, 1 for a
+// current state, 0 for an empty state, and -1 for malformed state.
+static int load_fan_state(FanControlState *state) {
+    int directory_fd = open_state_directory();
+    if (directory_fd < 0) {
+        return -1;
+    }
+
+    struct stat path_attributes;
+    int path_status = validate_state_path(directory_fd, &path_attributes);
+    if (path_status <= 0) {
+        close(directory_fd);
+        if (path_status == 0) {
+            memset(state, 0, sizeof(*state));
+        } else {
+            fprintf(stderr, "Privileged fan state path is unsafe.\n");
+        }
+        return path_status;
+    }
+
+    int state_fd = openat(
+        directory_fd,
+        FAN_STATE_BASENAME,
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+    );
+    if (state_fd < 0) {
+        close(directory_fd);
+        return -1;
+    }
+
+    struct stat attributes;
+    if (fstat(state_fd, &attributes) != 0
+        || !S_ISREG(attributes.st_mode)
+        || attributes.st_uid != 0
+        || attributes.st_nlink != 1
+        || (attributes.st_mode & 077) != 0
+        || attributes.st_dev != path_attributes.st_dev
+        || attributes.st_ino != path_attributes.st_ino) {
+        close(state_fd);
+        close(directory_fd);
+        return -1;
+    }
+    close(directory_fd);
+
     if (attributes.st_size == 0) {
         memset(state, 0, sizeof(*state));
+        close(state_fd);
         return 0;
     }
     if (attributes.st_size == (off_t)THERMOFAN_LEGACY_FAN_STATE_SIZE) {
@@ -550,8 +643,10 @@ static int load_fan_state(int state_fd, FanControlState *state) {
                 sizeof(legacy_bytes),
                 &legacy
             )) {
+            close(state_fd);
             return -1;
         }
+        close(state_fd);
         memset(state, 0, sizeof(*state));
         state->owner_pid = legacy.owner_pid;
         state->touched_mask = legacy.touched_mask;
@@ -560,33 +655,149 @@ static int load_fan_state(int state_fd, FanControlState *state) {
         return 2;
     }
     if (attributes.st_size != (off_t)sizeof(*state)) {
+        close(state_fd);
         return -1;
     }
 
     ssize_t count = pread(state_fd, state, sizeof(*state), 0);
+    close(state_fd);
     if (count != (ssize_t)sizeof(*state) || !fan_state_is_valid(state)) {
         return -1;
     }
     return 1;
 }
 
-static int save_fan_state(int state_fd, FanControlState *state) {
-    state->refcount = count_fan_bits(state->touched_mask);
-    state->checksum = fan_state_checksum(state);
-    if (pwrite(state_fd, state, sizeof(*state), 0) != (ssize_t)sizeof(*state)
-        || ftruncate(state_fd, (off_t)sizeof(*state)) != 0
-        || fsync(state_fd) != 0) {
-        fprintf(stderr, "Could not persist privileged fan ownership state: %s.\n", strerror(errno));
+static int write_all(int descriptor, const void *bytes, size_t length) {
+    const uint8_t *cursor = bytes;
+    size_t written = 0;
+    while (written < length) {
+        ssize_t count = write(descriptor, cursor + written, length - written);
+        if (count > 0) {
+            written += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
         return 1;
     }
     return 0;
 }
 
-static int clear_fan_state(int state_fd) {
-    if (ftruncate(state_fd, 0) != 0 || fsync(state_fd) != 0) {
-        fprintf(stderr, "Could not clear privileged fan ownership state: %s.\n", strerror(errno));
+static int save_fan_state(FanControlState *state) {
+    state->refcount = count_fan_bits(state->touched_mask);
+    state->checksum = fan_state_checksum(state);
+    if (!fan_state_is_valid(state)) {
+        fprintf(stderr, "Refusing to persist malformed fan ownership state.\n");
         return 1;
     }
+
+    int directory_fd = open_state_directory();
+    if (directory_fd < 0) {
+        return 1;
+    }
+
+    if (validate_state_path(directory_fd, NULL) < 0) {
+        fprintf(stderr, "Refusing to replace an unsafe privileged fan state path.\n");
+        close(directory_fd);
+        return 1;
+    }
+
+    int temporary_fd = -1;
+    char temporary_name[128];
+    for (int attempt = 0; attempt < STATE_TEMP_ATTEMPTS; attempt++) {
+        int length = snprintf(
+            temporary_name,
+            sizeof(temporary_name),
+            ".%s.%d.%08x.tmp",
+            FAN_STATE_BASENAME,
+            (int)getpid(),
+            arc4random()
+        );
+        if (length <= 0 || length >= (int)sizeof(temporary_name)) {
+            close(directory_fd);
+            return 1;
+        }
+        temporary_fd = openat(
+            directory_fd,
+            temporary_name,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            0600
+        );
+        if (temporary_fd >= 0 || errno != EEXIST) {
+            break;
+        }
+    }
+    if (temporary_fd < 0) {
+        fprintf(stderr, "Could not create atomic fan state: %s.\n", strerror(errno));
+        close(directory_fd);
+        return 1;
+    }
+
+    int status = 1;
+    if (fchown(temporary_fd, 0, 0) != 0
+        || fchmod(temporary_fd, 0600) != 0
+        || write_all(temporary_fd, state, sizeof(*state)) != 0
+        || fsync(temporary_fd) != 0) {
+        fprintf(stderr, "Could not persist privileged fan ownership state: %s.\n", strerror(errno));
+        goto done;
+    }
+    if (close(temporary_fd) != 0) {
+        temporary_fd = -1;
+        fprintf(stderr, "Could not close atomic fan state: %s.\n", strerror(errno));
+        goto done;
+    }
+    temporary_fd = -1;
+
+    if (renameat(
+            directory_fd,
+            temporary_name,
+            directory_fd,
+            FAN_STATE_BASENAME
+        ) != 0) {
+        fprintf(stderr, "Could not atomically publish fan ownership state: %s.\n", strerror(errno));
+        goto done;
+    }
+    temporary_name[0] = '\0';
+    if (fsync(directory_fd) != 0) {
+        fprintf(stderr, "Could not durably publish fan ownership state: %s.\n", strerror(errno));
+        goto done;
+    }
+    status = 0;
+
+done:
+    if (temporary_fd >= 0) {
+        close(temporary_fd);
+    }
+    if (temporary_name[0] != '\0') {
+        (void)unlinkat(directory_fd, temporary_name, 0);
+    }
+    close(directory_fd);
+    return status;
+}
+
+static int clear_fan_state(void) {
+    int directory_fd = open_state_directory();
+    if (directory_fd < 0) {
+        return 1;
+    }
+    int path_status = validate_state_path(directory_fd, NULL);
+    if (path_status < 0) {
+        fprintf(stderr, "Refusing to clear an unsafe privileged fan state path.\n");
+        close(directory_fd);
+        return 1;
+    }
+    if (path_status == 0) {
+        close(directory_fd);
+        return 0;
+    }
+    if (unlinkat(directory_fd, FAN_STATE_BASENAME, 0) != 0
+        || fsync(directory_fd) != 0) {
+        fprintf(stderr, "Could not durably clear privileged fan ownership state: %s.\n", strerror(errno));
+        close(directory_fd);
+        return 1;
+    }
+    close(directory_fd);
     return 0;
 }
 
@@ -767,7 +978,6 @@ static int release_fan_ownership(
     io_connect_t connection,
     int fan_index,
     const FanControlEndpoint *endpoint,
-    int state_fd,
     FanControlState *state,
     int *state_present
 ) {
@@ -797,14 +1007,14 @@ static int release_fan_ownership(
     FanControlState next = *state;
     next.touched_mask &= ~bit;
     if (next.touched_mask == 0) {
-        if (clear_fan_state(state_fd) != 0) {
+        if (clear_fan_state() != 0) {
             return 1;
         }
         memset(state, 0, sizeof(*state));
         *state_present = 0;
         return 0;
     }
-    if (save_fan_state(state_fd, &next) != 0) {
+    if (save_fan_state(&next) != 0) {
         return 1;
     }
     *state = next;
@@ -813,7 +1023,6 @@ static int release_fan_ownership(
 
 static int recover_stale_owner(
     io_connect_t connection,
-    int state_fd,
     FanControlState *state,
     int fan_count
 ) {
@@ -856,10 +1065,10 @@ static int recover_stale_owner(
         }
     }
 
-    if (clear_fan_state(state_fd) != 0) {
+    if (clear_fan_state() != 0) {
         return 1;
     }
-    fprintf(stderr, "Recovered stale fan ownership from exited process %d.\n", state->owner_pid);
+    fprintf(stderr, "Recovered durable fan ownership recorded for process %d.\n", state->owner_pid);
     memset(state, 0, sizeof(*state));
     return 0;
 }
@@ -870,7 +1079,6 @@ static int enable_manual_mode(
     const FanControlEndpoint *endpoint,
     int ftst_available,
     int ftst_enabled,
-    int state_fd,
     FanControlState *state
 ) {
     const double deadline = monotonic_seconds() + 10.0;
@@ -899,7 +1107,7 @@ static int enable_manual_mode(
         // helper can prove ownership and recover to Auto.
         FanControlState next = *state;
         next.flags |= FAN_STATE_FTST_OWNED;
-        if (save_fan_state(state_fd, &next) != 0) {
+        if (save_fan_state(&next) != 0) {
             return 1;
         }
         *state = next;
@@ -928,7 +1136,6 @@ static int apply_fan(
 ) {
     io_connect_t connection = IO_OBJECT_NULL;
     int lock_fd = -1;
-    int state_fd = -1;
     int status = 1;
 
     lock_fd = open_root_owned_file(FAN_LOCK_PATH);
@@ -936,10 +1143,6 @@ static int apply_fan(
         fprintf(stderr, "Could not serialize fan hardware access: %s.\n", strerror(errno));
         if (lock_fd >= 0) close(lock_fd);
         return 1;
-    }
-    state_fd = open_root_owned_file(FAN_STATE_PATH);
-    if (state_fd < 0) {
-        goto done;
     }
     if (open_smc(&connection) != 0) {
         goto done;
@@ -1008,7 +1211,7 @@ static int apply_fan(
     }
 
     FanControlState state;
-    int state_present = load_fan_state(state_fd, &state);
+    int state_present = load_fan_state(&state);
     int ftst_available = 0;
     int ftst_enabled = 0;
     if (read_ftst(connection, &ftst_available, &ftst_enabled) != 0) {
@@ -1018,7 +1221,7 @@ static int apply_fan(
     if (state_present == 2) {
         fprintf(stderr, "Migrating legacy fan ownership through verified automatic recovery.\n");
         const int automatic_recovery_verified =
-            recover_stale_owner(connection, state_fd, &state, fan_count) == 0;
+            recover_stale_owner(connection, &state, fan_count) == 0;
         if (!thermofan_legacy_migration_allows_new_write(automatic_recovery_verified)) {
             fprintf(stderr, "Legacy fan ownership could not be migrated safely; refusing new writes.\n");
             goto done;
@@ -1065,7 +1268,7 @@ static int apply_fan(
 
     if (state_present == 1) {
         if (!state_owner_process_is_current(&state)) {
-            if (recover_stale_owner(connection, state_fd, &state, fan_count) != 0) {
+            if (recover_stale_owner(connection, &state, fan_count) != 0) {
                 goto done;
             }
             state_present = 0;
@@ -1085,7 +1288,6 @@ static int apply_fan(
                 connection,
                 fan_index,
                 &endpoint,
-                state_fd,
                 &state,
                 &state_present
             ) != 0) {
@@ -1115,7 +1317,7 @@ static int apply_fan(
     if ((state.touched_mask & bit) == 0) {
         FanControlState next = state;
         next.touched_mask |= bit;
-        if (save_fan_state(state_fd, &next) != 0) {
+        if (save_fan_state(&next) != 0) {
             goto done;
         }
         state = next;
@@ -1127,11 +1329,10 @@ static int apply_fan(
             &endpoint,
             ftst_available,
             ftst_enabled,
-            state_fd,
             &state
         ) != 0) {
         fprintf(stderr, "Fan %d did not enter exact manual mode within the safety deadline; returning it to automatic mode.\n", fan_index + 1);
-        if (release_fan_ownership(connection, fan_index, &endpoint, state_fd, &state, &state_present) != 0) {
+        if (release_fan_ownership(connection, fan_index, &endpoint, &state, &state_present) != 0) {
             fprintf(stderr, "CRITICAL: Fan %d rollback could not be verified; ownership state was retained for watchdog recovery.\n", fan_index + 1);
             status = EXIT_RECOVERY_REQUIRED;
         }
@@ -1160,7 +1361,7 @@ static int apply_fan(
     if (!target_verified
         || !fan_manual_state_matches(connection, fan_index, &endpoint, 1)) {
         fprintf(stderr, "Fan %d target verification failed; requested %d RPM, SMC reports %.0f RPM. Returning to automatic mode.\n", fan_index + 1, rpm, applied_rpm);
-        if (release_fan_ownership(connection, fan_index, &endpoint, state_fd, &state, &state_present) != 0) {
+        if (release_fan_ownership(connection, fan_index, &endpoint, &state, &state_present) != 0) {
             fprintf(stderr, "CRITICAL: Fan %d rollback could not be verified; ownership state was retained for watchdog recovery.\n", fan_index + 1);
             status = EXIT_RECOVERY_REQUIRED;
         }
@@ -1175,9 +1376,9 @@ done:
     // the fan may still be Manual/unknown. Surface the dedicated result even if
     // the failure occurred before the explicit rollback branch (for example, a
     // transient SMC read failure during a later Auto request).
-    if (status != 0 && status != EXIT_RECOVERY_REQUIRED && state_fd >= 0) {
+    if (status != 0 && status != EXIT_RECOVERY_REQUIRED) {
         FanControlState persisted_state;
-        int persisted_state_present = load_fan_state(state_fd, &persisted_state);
+        int persisted_state_present = load_fan_state(&persisted_state);
         const int owner_matches = persisted_state_present == 1
             && state_owner_matches_identity(&persisted_state, owner_identity);
         const int fan_owned = persisted_state_present == 1
@@ -1193,9 +1394,6 @@ done:
     if (connection != IO_OBJECT_NULL) {
         IOServiceClose(connection);
     }
-    if (state_fd >= 0) {
-        close(state_fd);
-    }
     if (lock_fd >= 0) {
         (void)flock(lock_fd, LOCK_UN);
         close(lock_fd);
@@ -1203,165 +1401,669 @@ done:
     return status;
 }
 
-static int parse_int(const char *value, int *out) {
-    char *end = NULL;
-    errno = 0;
-    long parsed = strtol(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > 100000) {
-        return 1;
-    }
-    *out = (int)parsed;
-    return 0;
+const char *thermofan_engine_version(void) {
+    return HELPER_VERSION;
 }
 
-static int become_root(void) {
+static int engine_is_privileged(void) {
     if (geteuid() != 0) {
-        fprintf(stderr, "ThermoFanHelper must be installed before it can control hardware.\n");
+        fprintf(stderr, "ThermoFan's fan-control engine requires a root launch daemon.\n");
+        return 0;
+    }
+    return 1;
+}
+
+int thermofan_engine_apply(
+    int fan_index,
+    int mode,
+    int rpm,
+    const ProcessIdentity *owner_identity,
+    int require_owned_fan
+) {
+    static const char *mode_names[] = {"automatic", "fixed", "curve"};
+    if (!engine_is_privileged()
+        || fan_index < 0
+        || fan_index >= FAN_STATE_MAX_FANS
+        || mode < 0
+        || mode > 2
+        || owner_identity == NULL
+        || owner_identity->pid <= 1
+        || owner_identity->start_seconds == 0
+        || owner_identity->start_microseconds >= 1000000
+        || (require_owned_fan != 0 && require_owned_fan != 1)
+        || (mode == 0 && rpm != 0)
+        || (mode != 0 && (rpm < 0 || rpm > FAN_SAFE_MAX_RPM))) {
         return 1;
     }
-    if (setgid(0) != 0 || setuid(0) != 0) {
-        fprintf(stderr, "Could not activate helper privileges: %s.\n", strerror(errno));
+    if (mode != 0
+        && atomic_load_explicit(
+            &manual_writes_ready,
+            memory_order_acquire
+        ) != 1) {
+        fprintf(stderr, "Manual fan writes remain blocked until startup recovery and legacy retirement succeed.\n");
+        return EXIT_RECOVERY_REQUIRED;
+    }
+    return apply_fan(
+        fan_index,
+        mode_names[mode],
+        rpm,
+        owner_identity,
+        require_owned_fan
+    );
+}
+
+static int read_verified_fan_count(io_connect_t connection, int *fan_count) {
+    double fan_count_value = 0;
+    if (fan_count == NULL
+        || read_number(connection, "FNum", &fan_count_value) != 0
+        || !isfinite(fan_count_value)
+        || fan_count_value < 0
+        || fan_count_value > FAN_STATE_MAX_FANS
+        || fan_count_value != floor(fan_count_value)) {
+        fprintf(stderr, "The SMC fan count is outside the verified range.\n");
         return 1;
     }
+    *fan_count = (int)fan_count_value;
     return 0;
 }
 
-static int write_watchdog_ready(pid_t pid, int fan_index) {
-    char message[96];
-    int length = snprintf(message, sizeof(message), WATCHDOG_READY_FORMAT, (int)pid, fan_index);
-    if (length <= 0 || length >= (int)sizeof(message)) {
+static int recover_recorded_state(
+    const ProcessIdentity *owner_identity,
+    int require_exact_owner
+) {
+    if (!engine_is_privileged()) {
         return 1;
     }
 
-    size_t written = 0;
-    while (written < (size_t)length) {
-        ssize_t count = write(STDOUT_FILENO, message + written, (size_t)length - written);
-        if (count > 0) {
-            written += (size_t)count;
-            continue;
+    int status = EXIT_RECOVERY_REQUIRED;
+    int lock_fd = open_root_owned_file(FAN_LOCK_PATH);
+    io_connect_t connection = IO_OBJECT_NULL;
+    if (lock_fd < 0 || flock(lock_fd, LOCK_EX) != 0) {
+        fprintf(stderr, "Could not serialize startup fan recovery: %s.\n", strerror(errno));
+        if (lock_fd >= 0) {
+            close(lock_fd);
         }
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        return 1;
+        return EXIT_RECOVERY_REQUIRED;
     }
-    return 0;
+
+    FanControlState state;
+    int state_present = load_fan_state(&state);
+    if (state_present == 0) {
+        status = 0;
+        goto done;
+    }
+    if (state_present < 0) {
+        fprintf(stderr, "ThermoFan ownership state is malformed; automatic recovery is uncertain.\n");
+        goto done;
+    }
+    if (require_exact_owner) {
+        // The v1 layout has no process start time. PID alone is not cleanup
+        // authority because the PID may have been reused.
+        if (state_present != 1
+            || owner_identity == NULL
+            || !state_owner_matches_identity(&state, owner_identity)) {
+            status = 0;
+            goto done;
+        }
+    }
+
+    if (open_smc(&connection) != 0) {
+        goto done;
+    }
+    int fan_count = 0;
+    if (read_verified_fan_count(connection, &fan_count) != 0) {
+        goto done;
+    }
+    if (recover_stale_owner(connection, &state, fan_count) != 0) {
+        goto done;
+    }
+    status = 0;
+
+done:
+    if (connection != IO_OBJECT_NULL) {
+        IOServiceClose(connection);
+    }
+    (void)flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+    return status;
 }
 
-static int wait_for_process_exit(const ProcessIdentity *identity, int fan_index) {
-    // The app closes the readiness pipe after the handshake. Ignore SIGPIPE so
-    // later cleanup diagnostics cannot kill the watchdog before Auto recovery.
-    (void)signal(SIGPIPE, SIG_IGN);
+int thermofan_engine_recover_startup(void) {
+    atomic_store_explicit(&startup_recovery_succeeded, 0, memory_order_release);
+    atomic_store_explicit(&manual_writes_ready, 0, memory_order_release);
+    int status = recover_recorded_state(NULL, 0);
+    if (status == 0) {
+        atomic_store_explicit(&startup_recovery_succeeded, 1, memory_order_release);
+    }
+    return status;
+}
 
-    int readiness_sent = 0;
+int thermofan_engine_return_all(const ProcessIdentity *owner_identity) {
+    if (owner_identity == NULL
+        || owner_identity->pid <= 1
+        || owner_identity->start_seconds == 0
+        || owner_identity->start_microseconds >= 1000000) {
+        return 1;
+    }
+    return recover_recorded_state(owner_identity, 1);
+}
+
+int thermofan_engine_open_process_exit_watch(const ProcessIdentity *identity) {
+    if (identity == NULL || !process_identity_is_current(identity)) {
+        return -1;
+    }
+
     int queue = kqueue();
-    if (queue >= 0) {
-        struct kevent change;
-        struct kevent event;
-        EV_SET(&change, (uintptr_t)identity->pid, EVFILT_PROC, EV_ADD | EV_ENABLE | EV_ONESHOT, NOTE_EXIT, 0, NULL);
-        if (kevent(queue, &change, 1, NULL, 0, NULL) == 0) {
-            if (write_watchdog_ready((pid_t)identity->pid, fan_index) != 0) {
-                close(queue);
+    if (queue < 0) {
+        return -1;
+    }
+    struct kevent change;
+    EV_SET(
+        &change,
+        (uintptr_t)identity->pid,
+        EVFILT_PROC,
+        EV_ADD | EV_ENABLE | EV_ONESHOT,
+        NOTE_EXIT,
+        0,
+        NULL
+    );
+    if (kevent(queue, &change, 1, NULL, 0, NULL) != 0
+        || !process_identity_is_current(identity)) {
+        close(queue);
+        return -1;
+    }
+    return queue;
+}
+
+int thermofan_engine_consume_process_exit_watch(int watch_fd) {
+    if (watch_fd < 0) {
+        return 1;
+    }
+    struct kevent event;
+    for (;;) {
+        int result = kevent(watch_fd, NULL, 0, &event, 1, NULL);
+        if (result > 0) {
+            return event.filter == EVFILT_PROC
+                && (event.flags & EV_ERROR) == 0
+                && (event.fflags & NOTE_EXIT) != 0
+                ? 0
+                : 1;
+        }
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        return 1;
+    }
+}
+
+typedef struct {
+    const char *name;
+    const char *absolute_path;
+} LegacyHelperPath;
+
+static const LegacyHelperPath legacy_helper_paths[] = {
+    {
+        "io.github.girginomer10.ThermoFan.helper",
+        "/Library/PrivilegedHelperTools/io.github.girginomer10.ThermoFan.helper"
+    },
+    {
+        "io.github.girginomer10.ThermoFan.helper.version",
+        "/Library/PrivilegedHelperTools/io.github.girginomer10.ThermoFan.helper.version"
+    },
+    {
+        "local.codex.ThermoFan.helper",
+        "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper"
+    },
+    {
+        "local.codex.ThermoFan.helper.version",
+        "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper.version"
+    }
+};
+
+#define LEGACY_HELPER_COUNT \
+    (sizeof(legacy_helper_paths) / sizeof(legacy_helper_paths[0]))
+#define LEGACY_PROCESS_DRAIN_SECONDS 5.0
+#define LEGACY_PROCESS_DRAIN_POLL_MILLISECONDS 50
+#define LEGACY_PROCESS_DRAIN_CLEAR_SCANS 3
+
+typedef struct {
+    int file_descriptor;
+    struct stat attributes;
+} LegacyHelperInode;
+
+typedef struct {
+    ProcessIdentity *items;
+    size_t count;
+    size_t capacity;
+} LegacyProcessSet;
+
+static int legacy_helper_attributes_are_safe(const struct stat *attributes) {
+    return attributes != NULL
+        && S_ISREG(attributes->st_mode)
+        && attributes->st_uid == 0
+        && attributes->st_nlink == 1
+        && (attributes->st_mode & 0022) == 0;
+}
+
+static int attributes_identify_same_inode(
+    const struct stat *left,
+    const struct stat *right
+) {
+    return left != NULL
+        && right != NULL
+        && left->st_dev == right->st_dev
+        && left->st_ino == right->st_ino;
+}
+
+static void close_legacy_helper_inodes(LegacyHelperInode inodes[LEGACY_HELPER_COUNT]) {
+    for (size_t index = 0; index < LEGACY_HELPER_COUNT; index++) {
+        if (inodes[index].file_descriptor >= 0) {
+            close(inodes[index].file_descriptor);
+            inodes[index].file_descriptor = -1;
+        }
+    }
+}
+
+static int exact_legacy_executable_path(const char *path) {
+    if (path == NULL) {
+        return 0;
+    }
+    for (size_t index = 0; index < LEGACY_HELPER_COUNT; index++) {
+        if (strcmp(path, legacy_helper_paths[index].absolute_path) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int legacy_process_set_add(
+    LegacyProcessSet *processes,
+    const ProcessIdentity *identity
+) {
+    if (processes == NULL || identity == NULL) {
+        return 1;
+    }
+    for (size_t index = 0; index < processes->count; index++) {
+        if (thermofan_process_identity_matches(
+                processes->items[index].pid,
+                processes->items[index].start_seconds,
+                processes->items[index].start_microseconds,
+                identity->pid,
+                identity->start_seconds,
+                identity->start_microseconds
+            )) {
+            return 0;
+        }
+    }
+    if (processes->count == processes->capacity) {
+        size_t new_capacity = processes->capacity == 0
+            ? 4
+            : processes->capacity * 2;
+        if (new_capacity < processes->capacity
+            || new_capacity > SIZE_MAX / sizeof(*processes->items)) {
+            return 1;
+        }
+        ProcessIdentity *new_items = realloc(
+            processes->items,
+            new_capacity * sizeof(*new_items)
+        );
+        if (new_items == NULL) {
+            return 1;
+        }
+        processes->items = new_items;
+        processes->capacity = new_capacity;
+    }
+    processes->items[processes->count++] = *identity;
+    return 0;
+}
+
+static int snapshot_exact_legacy_processes(LegacyProcessSet *processes) {
+    if (processes == NULL) {
+        return 1;
+    }
+
+    int required_bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (required_bytes <= 0) {
+        fprintf(stderr, "Could not enumerate processes while retiring legacy helpers.\n");
+        return 1;
+    }
+
+    pid_t *process_ids = NULL;
+    int used_bytes = 0;
+    int buffer_bytes = required_bytes;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        const int headroom = 256 * (int)sizeof(pid_t);
+        if (buffer_bytes > INT_MAX - headroom) {
+            free(process_ids);
+            return 1;
+        }
+        buffer_bytes += headroom;
+        pid_t *larger_buffer = realloc(process_ids, (size_t)buffer_bytes);
+        if (larger_buffer == NULL) {
+            free(process_ids);
+            return 1;
+        }
+        process_ids = larger_buffer;
+        memset(process_ids, 0, (size_t)buffer_bytes);
+        used_bytes = proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            process_ids,
+            buffer_bytes
+        );
+        if (used_bytes < 0 || used_bytes > buffer_bytes) {
+            free(process_ids);
+            return 1;
+        }
+        if (used_bytes < buffer_bytes) {
+            break;
+        }
+        if (attempt == 3) {
+            free(process_ids);
+            fprintf(stderr, "Process enumeration remained truncated during legacy retirement.\n");
+            return 1;
+        }
+    }
+    if (used_bytes == 0 || used_bytes % (int)sizeof(pid_t) != 0) {
+        free(process_ids);
+        return 1;
+    }
+
+    size_t process_count = (size_t)used_bytes / sizeof(pid_t);
+    for (size_t index = 0; index < process_count; index++) {
+        pid_t process_id = process_ids[index];
+        if (process_id <= 1) {
+            continue;
+        }
+        char executable_path[PROC_PIDPATHINFO_MAXSIZE];
+        memset(executable_path, 0, sizeof(executable_path));
+        int path_length = proc_pidpath(
+            process_id,
+            executable_path,
+            (uint32_t)sizeof(executable_path)
+        );
+        if (path_length <= 0) {
+            continue;
+        }
+        executable_path[sizeof(executable_path) - 1] = '\0';
+        if (!exact_legacy_executable_path(executable_path)) {
+            continue;
+        }
+
+        ProcessIdentity identity;
+        if (thermofan_engine_read_process_identity(process_id, &identity) != 0) {
+            // An exit between proc_pidpath and proc_pidinfo is harmless. Any
+            // still-running exact-path process must remain identifiable.
+            memset(executable_path, 0, sizeof(executable_path));
+            if (proc_pidpath(
+                    process_id,
+                    executable_path,
+                    (uint32_t)sizeof(executable_path)
+                ) > 0
+                && exact_legacy_executable_path(executable_path)) {
+                free(process_ids);
+                fprintf(stderr, "Could not identify an active legacy helper process safely.\n");
                 return 1;
             }
-            readiness_sent = 1;
-            for (;;) {
-                int result = kevent(queue, NULL, 0, &event, 1, NULL);
-                if (result > 0) {
-                    close(queue);
-                    return 0;
-                }
-                if (result < 0 && errno == EINTR) {
-                    continue;
-                }
-                break;
-            }
-            close(queue);
+            continue;
         }
-        else {
-            close(queue);
+        if (legacy_process_set_add(processes, &identity) != 0) {
+            free(process_ids);
+            return 1;
         }
     }
+    free(process_ids);
+    return 0;
+}
 
-    if (!process_identity_is_current(identity)) {
-        return 0;
-    }
-    if (!readiness_sent && write_watchdog_ready((pid_t)identity->pid, fan_index) != 0) {
+static int legacy_process_set_has_current_processes(
+    const LegacyProcessSet *processes
+) {
+    if (processes == NULL) {
         return 1;
     }
-    while (process_identity_is_current(identity)) {
-        sleep(2);
+    for (size_t index = 0; index < processes->count; index++) {
+        if (process_identity_is_current(&processes->items[index])) {
+            return 1;
+        }
     }
     return 0;
 }
 
-int main(int argc, char **argv) {
-    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        printf("%s\n", HELPER_VERSION);
-        return 0;
-    }
-
-    if (argc == 4 && strcmp(argv[1], "--watch") == 0) {
-        int parent_pid = 0;
-        int fan_index = 0;
-        if (parse_int(argv[2], &parent_pid) != 0 || parent_pid <= 1 || parent_pid != getppid()) {
-            fprintf(stderr, "The watchdog may only monitor its launching application.\n");
-            return 64;
-        }
-        if (parse_int(argv[3], &fan_index) != 0 || fan_index > 7) {
-            fprintf(stderr, "Invalid fan index.\n");
-            return 64;
-        }
-        if (become_root() != 0) {
-            return 1;
-        }
-        ProcessIdentity parent_identity;
-        if (read_process_identity((pid_t)parent_pid, &parent_identity) != 0) {
-            fprintf(stderr, "The watchdog could not identify its launching application.\n");
-            return 1;
-        }
-        if (wait_for_process_exit(&parent_identity, fan_index) != 0) {
-            fprintf(stderr, "The watchdog could not confirm monitoring readiness.\n");
-            return 1;
-        }
-        return apply_fan(fan_index, "automatic", 0, &parent_identity, 1);
-    }
-
-    if (argc < 4 || strcmp(argv[1], "--fanctl") != 0) {
-        fprintf(stderr, "Usage: ThermoFanHelper --fanctl <fan-index> <automatic|fixed|curve> [rpm]\n");
-        return 64;
-    }
-
-    int fan_index = 0;
-    if (parse_int(argv[2], &fan_index) != 0 || fan_index > 7) {
-        fprintf(stderr, "Invalid fan index.\n");
-        return 64;
-    }
-
-    const char *mode = argv[3];
-    if (strcmp(mode, "automatic") != 0 && strcmp(mode, "auto") != 0 && strcmp(mode, "fixed") != 0 && strcmp(mode, "curve") != 0) {
-        fprintf(stderr, "Invalid fan mode.\n");
-        return 64;
-    }
-    int rpm = 0;
-    if (strcmp(mode, "automatic") != 0 && strcmp(mode, "auto") != 0) {
-        if (argc != 5 || parse_int(argv[4], &rpm) != 0 || rpm > FAN_SAFE_MAX_RPM) {
-            fprintf(stderr, "RPM is required for fixed or curve mode.\n");
-            return 64;
-        }
-    } else if (argc != 4) {
-        fprintf(stderr, "Automatic mode does not accept an RPM.\n");
-        return 64;
-    }
-
-    if (become_root() != 0) {
+static int drain_exact_legacy_processes(LegacyProcessSet *processes) {
+    struct timespec started;
+    if (processes == NULL
+        || clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
         return 1;
     }
 
-    ProcessIdentity parent_identity;
-    if (read_process_identity(getppid(), &parent_identity) != 0) {
-        fprintf(stderr, "The helper could not identify its launching application.\n");
+    int consecutive_clear_scans = 0;
+    for (;;) {
+        if (snapshot_exact_legacy_processes(processes) != 0) {
+            return 1;
+        }
+        if (legacy_process_set_has_current_processes(processes)) {
+            consecutive_clear_scans = 0;
+        } else {
+            consecutive_clear_scans++;
+            if (consecutive_clear_scans >= LEGACY_PROCESS_DRAIN_CLEAR_SCANS) {
+                return 0;
+            }
+        }
+
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            return 1;
+        }
+        double elapsed = (double)(now.tv_sec - started.tv_sec)
+            + ((double)(now.tv_nsec - started.tv_nsec) / 1000000000.0);
+        if (elapsed >= LEGACY_PROCESS_DRAIN_SECONDS) {
+            fprintf(stderr, "Timed out waiting for an exact legacy helper process to exit.\n");
+            return 1;
+        }
+        sleep_milliseconds(LEGACY_PROCESS_DRAIN_POLL_MILLISECONDS);
+    }
+}
+
+static int open_and_verify_legacy_helpers(
+    int directory_fd,
+    LegacyHelperInode inodes[LEGACY_HELPER_COUNT]
+) {
+    for (size_t index = 0; index < LEGACY_HELPER_COUNT; index++) {
+        struct stat path_attributes;
+        if (fstatat(
+                directory_fd,
+                legacy_helper_paths[index].name,
+                &path_attributes,
+                AT_SYMLINK_NOFOLLOW
+            ) != 0) {
+            if (errno == ENOENT) {
+                continue;
+            }
+            return 1;
+        }
+        if (!legacy_helper_attributes_are_safe(&path_attributes)) {
+            fprintf(stderr, "Refusing to retire unsafe legacy helper path %s.\n", legacy_helper_paths[index].name);
+            return 1;
+        }
+
+        int file_descriptor = openat(
+            directory_fd,
+            legacy_helper_paths[index].name,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+        );
+        if (file_descriptor < 0) {
+            return 1;
+        }
+        struct stat descriptor_attributes;
+        if (fstat(file_descriptor, &descriptor_attributes) != 0
+            || !legacy_helper_attributes_are_safe(&descriptor_attributes)
+            || !attributes_identify_same_inode(
+                &path_attributes,
+                &descriptor_attributes
+            )) {
+            close(file_descriptor);
+            fprintf(stderr, "Legacy helper path changed during safe retirement.\n");
+            return 1;
+        }
+        inodes[index].file_descriptor = file_descriptor;
+        inodes[index].attributes = descriptor_attributes;
+    }
+    return 0;
+}
+
+static int revoke_legacy_helper_execution(
+    LegacyHelperInode inodes[LEGACY_HELPER_COUNT]
+) {
+    const mode_t forbidden_mode = S_ISUID | S_ISGID
+        | S_IXUSR | S_IXGRP | S_IXOTH;
+    for (size_t index = 0; index < LEGACY_HELPER_COUNT; index++) {
+        int file_descriptor = inodes[index].file_descriptor;
+        if (file_descriptor < 0) {
+            continue;
+        }
+        mode_t safe_mode = inodes[index].attributes.st_mode & 07777;
+        safe_mode &= ~forbidden_mode;
+        if (fchmod(file_descriptor, safe_mode) != 0
+            || fsync(file_descriptor) != 0) {
+            fprintf(stderr, "Could not revoke legacy helper execution safely.\n");
+            return 1;
+        }
+        struct stat revoked_attributes;
+        if (fstat(file_descriptor, &revoked_attributes) != 0
+            || !legacy_helper_attributes_are_safe(&revoked_attributes)
+            || !attributes_identify_same_inode(
+                &inodes[index].attributes,
+                &revoked_attributes
+            )
+            || (revoked_attributes.st_mode & forbidden_mode) != 0) {
+            fprintf(stderr, "Legacy helper execution revocation could not be verified.\n");
+            return 1;
+        }
+        inodes[index].attributes = revoked_attributes;
+    }
+    return 0;
+}
+
+static int unlink_revoked_legacy_helpers(
+    int directory_fd,
+    LegacyHelperInode inodes[LEGACY_HELPER_COUNT]
+) {
+    int removed_any = 0;
+    for (size_t index = 0; index < LEGACY_HELPER_COUNT; index++) {
+        int file_descriptor = inodes[index].file_descriptor;
+        if (file_descriptor < 0) {
+            continue;
+        }
+        struct stat path_attributes;
+        if (fstatat(
+                directory_fd,
+                legacy_helper_paths[index].name,
+                &path_attributes,
+                AT_SYMLINK_NOFOLLOW
+            ) != 0
+            || !legacy_helper_attributes_are_safe(&path_attributes)
+            || !attributes_identify_same_inode(
+                &inodes[index].attributes,
+                &path_attributes
+            )
+            || (path_attributes.st_mode
+                & (S_ISUID | S_ISGID | S_IXUSR | S_IXGRP | S_IXOTH)) != 0) {
+            fprintf(stderr, "Legacy helper path changed before unlink.\n");
+            return 1;
+        }
+        if (unlinkat(directory_fd, legacy_helper_paths[index].name, 0) != 0) {
+            return 1;
+        }
+        struct stat unlinked_attributes;
+        if (fstat(file_descriptor, &unlinked_attributes) != 0
+            || unlinked_attributes.st_nlink != 0
+            || !attributes_identify_same_inode(
+                &inodes[index].attributes,
+                &unlinked_attributes
+            )) {
+            fprintf(stderr, "Legacy helper unlink could not be verified.\n");
+            return 1;
+        }
+        removed_any = 1;
+    }
+    if (removed_any && fsync(directory_fd) != 0) {
         return 1;
     }
-    return apply_fan(fan_index, mode, rpm, &parent_identity, 0);
+    return 0;
+}
+
+int thermofan_engine_remove_legacy_helpers(void) {
+    if (!engine_is_privileged()) {
+        return 1;
+    }
+    atomic_store_explicit(&manual_writes_ready, 0, memory_order_release);
+    int expected_recovery_state = 1;
+    if (!atomic_compare_exchange_strong_explicit(
+            &startup_recovery_succeeded,
+            &expected_recovery_state,
+            0,
+            memory_order_acq_rel,
+            memory_order_acquire
+        )) {
+        fprintf(stderr, "Legacy helper cleanup requires successful startup recovery.\n");
+        return 1;
+    }
+
+    const char *directory_path = "/Library/PrivilegedHelperTools";
+    LegacyHelperInode inodes[LEGACY_HELPER_COUNT];
+    for (size_t index = 0; index < LEGACY_HELPER_COUNT; index++) {
+        memset(&inodes[index], 0, sizeof(inodes[index]));
+        inodes[index].file_descriptor = -1;
+    }
+    LegacyProcessSet legacy_processes = {0};
+    int directory_fd = open(
+        directory_path,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+    );
+    if (directory_fd < 0) {
+        if (errno != ENOENT) {
+            return 1;
+        }
+    } else {
+        struct stat directory_attributes;
+        if (fstat(directory_fd, &directory_attributes) != 0
+            || !S_ISDIR(directory_attributes.st_mode)
+            || directory_attributes.st_uid != 0
+            || (directory_attributes.st_mode & 0022) != 0) {
+            fprintf(stderr, "Legacy helper directory has unsafe ownership or permissions.\n");
+            close(directory_fd);
+            return 1;
+        }
+        if (open_and_verify_legacy_helpers(directory_fd, inodes) != 0
+            || revoke_legacy_helper_execution(inodes) != 0
+            || snapshot_exact_legacy_processes(&legacy_processes) != 0
+            || unlink_revoked_legacy_helpers(directory_fd, inodes) != 0) {
+            close_legacy_helper_inodes(inodes);
+            close(directory_fd);
+            free(legacy_processes.items);
+            return 1;
+        }
+        close_legacy_helper_inodes(inodes);
+        close(directory_fd);
+    }
+
+    // Scan once more after path retirement. This also covers a previous
+    // fail-closed attempt that already removed the directory entry while an
+    // exact legacy process was still exiting.
+    int status = snapshot_exact_legacy_processes(&legacy_processes);
+    if (status == 0) {
+        status = drain_exact_legacy_processes(&legacy_processes);
+    }
+    free(legacy_processes.items);
+    if (status != 0) {
+        return 1;
+    }
+    if (recover_recorded_state(NULL, 0) != 0) {
+        fprintf(stderr, "Final automatic recovery after legacy retirement failed.\n");
+        return 1;
+    }
+    atomic_store_explicit(&startup_recovery_succeeded, 1, memory_order_release);
+    atomic_store_explicit(&manual_writes_ready, 1, memory_order_release);
+    return 0;
 }

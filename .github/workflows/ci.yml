@@ -14,13 +14,17 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build and test
-    runs-on: macos-15
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Show toolchain
         run: swift --version
@@ -32,26 +36,45 @@ jobs:
         run: |
           bash -n scripts/build_app.sh
           bash -n scripts/release_direct.sh
+          REQ='anchor apple generic and identifier "io.github.girginomer10.ThermoFan" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ABCDE12345" and ! entitlement["com.apple.security.get-task-allow"] exists'
+          csreq -r="$REQ" -t >/dev/null
 
       - name: Build app bundle
         run: ./scripts/build_app.sh
 
       - name: Verify code signatures
         run: |
-          codesign --verify --strict dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper
+          codesign --verify --strict dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper
           codesign --verify --deep --strict dist/ThermoFan.app
-          codesign -d --verbose=4 dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper 2>&1 | grep -Eq '^CodeDirectory .* flags=.*\(.*runtime.*\)'
-          codesign -d --verbose=4 dist/ThermoFan.app 2>&1 | grep -Eq '^CodeDirectory .* flags=.*\(.*runtime.*\)'
+          HELPER_SIGNATURE="$(codesign -d --verbose=4 dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper 2>&1)"
+          APP_SIGNATURE="$(codesign -d --verbose=4 dist/ThermoFan.app 2>&1)"
+          grep -Eq '^CodeDirectory .* flags=.*\(.*runtime.*\)' <<<"$HELPER_SIGNATURE"
+          grep -Eq '^CodeDirectory .* flags=.*\(.*runtime.*\)' <<<"$APP_SIGNATURE"
 
       - name: Verify bundle metadata
         run: |
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' dist/ThermoFan.app/Contents/Info.plist)" = "io.github.girginomer10.ThermoFan"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.2.6"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/ThermoFan.app/Contents/Info.plist)" = "8"
-          grep -q '^#define HELPER_VERSION "8"$' Helpers/ThermoFanHelper/main.c
-          test "$(dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper --version)" = "8"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.3.0"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/ThermoFan.app/Contents/Info.plist)" = "9"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ThermoFanGitCommit' dist/ThermoFan.app/Contents/Info.plist)" = "$(git rev-parse HEAD)"
+          grep -q '^    public static let implementationRevision = 9$' Sources/FanControlXPC/ThermoFanXPC.swift
+          grep -q '^    public static let stableRecoveryProtocolVersion = 9$' Sources/FanControlXPC/ThermoFanXPC.swift
+          grep -q '^    func recoveryHandshake($' Sources/FanControlXPC/ThermoFanXPC.swift
+          grep -q '^    func prepareForServiceRemoval($' Sources/FanControlXPC/ThermoFanXPC.swift
+          grep -q '^#define THERMOFAN_ENGINE_PROTOCOL_VERSION 9$' Helpers/ThermoFanHelper/include/ThermoFanEngine.h
           grep -q '^#define EXIT_RECOVERY_REQUIRED 75$' Helpers/ThermoFanHelper/main.c
           test "$(lipo -archs dist/ThermoFan.app/Contents/MacOS/ThermoFan)" = "arm64"
-          test "$(lipo -archs dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper)" = "arm64"
-          test "$(xcrun vtool -show-build dist/ThermoFan.app/Contents/MacOS/ThermoFan | awk '$1 == "minos" { print $2; exit }')" = "14.0"
-          test "$(xcrun vtool -show-build dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper | awk '$1 == "minos" { print $2; exit }')" = "14.0"
+          test "$(lipo -archs dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper)" = "arm64"
+          APP_BUILD_INFO="$(xcrun vtool -show-build dist/ThermoFan.app/Contents/MacOS/ThermoFan)"
+          HELPER_BUILD_INFO="$(xcrun vtool -show-build dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper)"
+          test "$(awk '$1 == "minos" { print $2; exit }' <<<"$APP_BUILD_INFO")" = "14.0"
+          test "$(awk '$1 == "minos" { print $2; exit }' <<<"$HELPER_BUILD_INFO")" = "14.0"
+          test ! -e dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools
+          test "$(stat -f '%Lp' dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper)" = "755"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :Label' dist/ThermoFan.app/Contents/Library/LaunchDaemons/io.github.girginomer10.ThermoFan.helper.plist)" = "io.github.girginomer10.ThermoFan.helper"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :BundleProgram' dist/ThermoFan.app/Contents/Library/LaunchDaemons/io.github.girginomer10.ThermoFan.helper.plist)" = "Contents/MacOS/ThermoFanHelper"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :MachServices:io.github.girginomer10.ThermoFan.helper' dist/ThermoFan.app/Contents/Library/LaunchDaemons/io.github.girginomer10.ThermoFan.helper.plist)" = "true"
+          APP_STRINGS="$(strings dist/ThermoFan.app/Contents/MacOS/ThermoFan)"
+          HELPER_STRINGS="$(strings dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper)"
+          ! grep -Eq -- '--fanctl|--watch|THERMOFAN_WATCHDOG_READY|osascript' <<<"$APP_STRINGS"
+          ! grep -Eq -- '--fanctl|--watch|THERMOFAN_WATCHDOG_READY|osascript' <<<"$HELPER_STRINGS"

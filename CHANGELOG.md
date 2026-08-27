@@ -14,8 +14,18 @@ and the project uses semantic versioning while it remains pre-1.0.
 - Deterministic M-series fixtures cover fanless, one/two-fan, uppercase,
   lowercase, monitoring-only, sensor-family, and wake-cache behavior.
 - The direct-distribution build can produce an arm64 Developer ID/Hardened
-  Runtime bundle, with a guarded notarized-DMG release script and documented
-  public-release gates.
+  Runtime bundle, with an authenticated LaunchDaemon payload, guarded
+  notarized-DMG release script, and documented public-release gates.
+- Privileged writes now use protocol 9 over a narrow NSXPC interface to an
+  embedded `SMAppService` LaunchDaemon. The helper remains inside
+  `Contents/MacOS` and its plist inside `Contents/Library/LaunchDaemons`.
+- Hardware Helper status now distinguishes registration, administrator approval
+  in Login Items, update, recovery-blocked, and ready states.
+- Recovery now covers heartbeat expiry, XPC loss, exact client-process exit,
+  active-console-user change, daemon signals, and daemon startup.
+- Protocol 9 reserves a harmless stable recovery handshake plus an
+  Auto-and-unregister selector for future updates, and provides an in-app
+  verified **Unregister** action.
 
 ### Changed
 
@@ -30,18 +40,28 @@ and the project uses semantic versioning while it remains pre-1.0.
   old curve target active.
 - Fan counts and mode values now use the helper's exact decoding rules; corrupt
   or sentinel RPM ranges above 20,000 are monitoring-only.
-- The privileged helper protocol is now version 8, requires a verified
-  pre-write crash-watchdog handshake, and serializes concurrent fan
-  transactions across helper/watchdog processes. Valid v7 ownership state is
-  migrated through verified automatic recovery before any new write.
+- The app and daemon now mutually enforce the exact Developer ID identifier and
+  Team ID, Developer ID certificate markers, and absence of `get-task-allow`.
+  The daemon also requires the active local graphical console UID and audit
+  session.
+- Protocol 9 requires a verified pre-write process-exit watch and heartbeat
+  lease, rejects stale request revisions, and serializes fan transactions.
+- Root-owned fan ownership state is atomically replaced and binds each fan mask
+  to the authenticated PID plus process start time.
+- The old setuid installer and command-line write surface were removed. Startup
+  recovers durable legacy ownership, revokes/removes only known safe legacy
+  inodes, drains exact legacy processes, and verifies Auto again before opening
+  the manual-write gate; there is no legacy fallback.
+- Ad-hoc builds are monitoring-only. Runtime privileged authorization requires
+  a Developer ID signed app installed in `/Applications` and approved by macOS;
+  any public artifact must additionally pass notarization and Gatekeeper gates.
 
 ### Fixed
 
-- The privileged watchdog now becomes ready before the first manual write;
-  one-shot fixed/curve CLI writes that cannot provide this guarantee are
-  rejected.
+- The root daemon now arms its exact-process watchdog before the first manual
+  write; one-shot fixed/curve CLI writes are unavailable.
 - A rollback that cannot be verified is no longer collapsed into a generic
-  error; it starts bounded Auto retries while preserving watchdog recovery.
+  error; it starts an independent backoff Auto-recovery supervisor.
 - An Auto failure for a fan ThermoFan does not own no longer claims that a
   watchdog is available; recovery-required status now needs matching durable
   process ownership and the exact fan bit.
@@ -51,6 +71,13 @@ and the project uses semantic versioning while it remains pre-1.0.
   independently verified in the build script and CI.
 - Direct-release DMG staging now keeps candidate artifacts outside the mounted
   payload, preventing a partial nested copy of the DMG from entering itself.
+- The direct-release script now rejects setuid bits, legacy helper payloads and
+  CLI markers, Team ID mismatches, debug entitlements, and non-exact app/helper
+  requirements before notarization.
+- Direct releases now require a clean `origin/main` SHA before and after the
+  build, passing tests, a build number tied to the helper revision, zero
+  notary-log issues, post-staple mounted-payload verification, and a SHA-bound
+  evidence plist. CI covers arm64 macOS 14, 15, and 26.
 
 - Menu-bar temperatures now use a short median window so a single transient SMC
   spike does not flash as the current hottest reading.

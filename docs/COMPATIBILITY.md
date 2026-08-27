@@ -3,6 +3,12 @@
 ThermoFan targets arm64 Macs running macOS 14 or newer. Compatibility is based
 on runtime capabilities, not the marketing name of the chip.
 
+Local ad-hoc builds can exercise monitoring and diagnostics but cannot register
+the privileged fan-control daemon. Physical write/recovery acceptance therefore
+requires a Developer ID signed candidate installed in `/Applications` and
+approved by macOS. Any distributed candidate must separately pass the
+notarization and Gatekeeper release gates.
+
 ## Runtime Policy
 
 - `FNum = 0` is a normal fanless Mac; temperature monitoring remains available.
@@ -35,7 +41,7 @@ Only the last level justifies listing a Mac as verified by ThermoFan.
 | M1 | fanless, one/two fan, uppercase mode | Pending model matrix |
 | M2 | fanless, one/two fan, uppercase/legacy sensors | Pending model matrix |
 | M3 | fanless, one/two fan, firmware-unlock path | Pending model matrix |
-| M4 | fanless, one/two fan, uppercase mode/unlock | Mac16,11 M4 Pro read path verified on the current v8 build; v8 write/watchdog acceptance and other models pending |
+| M4 | fanless, one/two fan, uppercase mode/unlock | Mac16,11 M4 Pro read-only path observed; protocol 9 physical write/recovery acceptance and other models pending |
 | M5 | fanless, one/two fan, lowercase mode | Pending model matrix |
 
 External protocol evidence (not ThermoFan verification) is tracked from the
@@ -62,10 +68,13 @@ behavior.
 3. Under observation, request a safe target above current RPM.
 4. Verify manual mode and target read-back, then observe actual RPM change.
 5. Return to Auto and verify both mode and physical RPM recovery.
-6. Repeat after sleep/wake, app force-quit, helper update, and a second user
-   account where applicable.
-7. Re-run after material macOS updates; private SMC behavior can change.
+6. Confirm XPC disconnect, app force-quit/process exit, heartbeat timeout,
+   daemon restart/termination, and sleep/wake all return owned fans to Auto.
+7. Repeat helper approval/update and active-user changes, including a second
+   local user account where applicable.
+8. Re-run after material macOS updates; private SMC behavior can change.
 
 Submit results with the repository's hardware compatibility issue form. Until
 these rows are completed, the correct product statement is “M1-M5 capability
 detection with fail-closed control,” not “verified on every M-series Mac.”
+The protocol 9 migration itself did not perform a physical fan write.

@@ -42,6 +42,7 @@ final class ThermalStore: ObservableObject {
     private var pendingSave: DispatchWorkItem?
     private var wakeCancellable: AnyCancellable?
     private var pendingWakeReapplyAttempts: [String: Int] = [:]
+    private var wakeSafetyResetPending = false
     private var activeHardwareFanIDs: Set<String> = []
     private var automaticRecoveryFanIDs: Set<String> = []
     private var automaticRecoveryAttempts: [String: Int] = [:]
@@ -53,6 +54,7 @@ final class ThermalStore: ObservableObject {
     private static let curveHysteresisRPM = 100
     private static let maximumWakeReapplyAttempts = 3
     private static let maximumAutomaticRecoveryAttempts = 3
+    private static let legacyMigrationWarning = "Security upgrade required: an older privileged ThermoFan helper is still installed. Approve the authenticated Hardware Helper migration to revoke and remove it before using fan control."
     /// Ring buffer of recent temperature readings per sensor (max 3). Used to
     /// compute a median for the menu bar display, preventing transient SMC
     /// spikes from flashing a misleading value in the status bar.
@@ -84,6 +86,10 @@ final class ThermalStore: ObservableObject {
                     self?.handleWake()
                 }
             }
+        if fanControl.hasLegacyPrivilegedHelper {
+            updateLegacyMigrationWarning()
+            installHelper()
+        }
         refresh()
         restartTimer()
     }
@@ -213,6 +219,7 @@ final class ThermalStore: ObservableObject {
         guard generation == sampleGeneration else { return }
         let previousSettings = currentFanSettings()
         machine = snapshot.machine
+        updateLegacyMigrationWarning()
         warnings = snapshot.warnings + appWarnings
         helperState = fanControl.persistentHelperState
         let continuousSensors = SensorContinuity.merging(
@@ -504,9 +511,9 @@ final class ThermalStore: ObservableObject {
         applyFanWithAdmin(fanID)
     }
 
-    /// Installs the helper if needed, then writes the fan's staged setting to
-    /// hardware. The privileged/blocking work (admin prompt, Process spawn) runs
-    /// off the main actor so the password sheet never freezes the UI.
+    /// Registers the helper if needed, then writes the fan's staged setting to
+    /// hardware. Registration and authenticated XPC work run off the main actor
+    /// so macOS approval and hardware read-back never freeze the UI.
     func applyFanWithAdmin(_ fanID: String) {
         guard let index = fans.firstIndex(where: { $0.id == fanID }) else { return }
         guard !applyingFanIDs.contains(fanID) else { return }
@@ -661,6 +668,7 @@ final class ThermalStore: ObservableObject {
         controlQueue.async {
             let result = control.installPersistentHelper()
             let helperState = control.persistentHelperState
+            let legacyHelperRemains = control.hasLegacyPrivilegedHelper
             let message: String
             switch result {
             case .applied(let text), .failed(let text), .recoveryRequired(let text):
@@ -669,10 +677,31 @@ final class ThermalStore: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.helperState = helperState
                 self?.installingHelper = false
+                self?.updateLegacyMigrationWarning(legacyHelperRemains: legacyHelperRemains)
                 if helperState != .ready {
                     self?.addWarning(message)
                 } else {
                     self?.appWarnings.removeAll { $0.localizedCaseInsensitiveContains("Hardware Helper") }
+                }
+            }
+        }
+    }
+
+    func unregisterHelper() {
+        guard !installingHelper else { return }
+        let control = fanControl
+        installingHelper = true
+        controlQueue.async {
+            let result = control.unregisterPersistentHelper()
+            let helperState = control.persistentHelperState
+            Task { @MainActor [weak self] in
+                self?.helperState = helperState
+                self?.installingHelper = false
+                switch result {
+                case .applied(let message):
+                    self?.addWarning(message)
+                case .failed(let message), .recoveryRequired(let message):
+                    self?.addWarning(message)
                 }
             }
         }
@@ -736,20 +765,16 @@ final class ThermalStore: ObservableObject {
         }
     }
 
-    /// Returns forced fans to automatic control before the app exits so a fan is
-    /// never left pinned with nothing monitoring temperature. Best-effort and
-    /// synchronous because the process is terminating.
+    /// Returns every daemon-owned fan to automatic control before the app exits.
+    /// The daemon also recovers on connection invalidation/process exit, so this
+    /// synchronous request is the first of multiple independent safety paths.
     func restoreAutomaticControlOnQuit() {
         flushSaveSynchronously()
-        guard helperInstalled else { return }
-        let forced = fans.filter { activeHardwareFanIDs.contains($0.id) }
-        guard !forced.isEmpty else { return }
-        let control = fanControl
-        for fan in forced {
-            var reset = fan
-            reset.mode = .automatic
-            _ = control.applyWithPersistentHelper(reset)
-        }
+        guard helperState == .ready
+                || helperState == .recoveryBlocked
+                || !activeHardwareFanIDs.isEmpty
+        else { return }
+        _ = fanControl.returnAllToAutomatic()
     }
 
     var hasForcedFans: Bool {
@@ -1175,6 +1200,20 @@ final class ThermalStore: ObservableObject {
         pendingWakeReapplyAttempts = Dictionary(
             uniqueKeysWithValues: activeHardwareFanIDs.map { ($0, 0) }
         )
+        let requiresSafetyReset = !pendingWakeReapplyAttempts.isEmpty
+        wakeSafetyResetPending = requiresSafetyReset
+        if requiresSafetyReset {
+            let control = fanControl
+            controlQueue.async {
+                let result = control.returnAllToAutomatic()
+                Task { @MainActor [weak self] in
+                    self?.finishWakeSafetyReset(
+                        result,
+                        helperState: control.persistentHelperState
+                    )
+                }
+            }
+        }
         restartTimer()
         isSampling = true
         isRefreshing = true
@@ -1192,7 +1231,35 @@ final class ThermalStore: ObservableObject {
         }
     }
 
+    private func finishWakeSafetyReset(
+        _ result: FanControlService.ApplyResult,
+        helperState: HardwareHelperState
+    ) {
+        self.helperState = helperState
+        wakeSafetyResetPending = false
+        switch result {
+        case .applied:
+            // Re-arm only after the post-wake topology sample has completed.
+            if !isSampling {
+                reapplyActiveFansAfterWake()
+            }
+        case .failed(let message), .recoveryRequired(let message):
+            let affectedFanIDs = Array(pendingWakeReapplyAttempts.keys)
+            pendingWakeReapplyAttempts.removeAll()
+            addWarning("Post-wake automatic recovery was not verified: \(message)")
+            for fanID in affectedFanIDs {
+                automaticRecoveryFanIDs.insert(fanID)
+                automaticRecoveryAttempts[fanID] = 0
+                scheduleAutomaticRecovery(
+                    fanID: fanID,
+                    reason: "Post-wake automatic recovery must succeed before manual control can resume."
+                )
+            }
+        }
+    }
+
     private func reapplyActiveFansAfterWake() {
+        guard !wakeSafetyResetPending else { return }
         guard helperInstalled else {
             addWarning("Fan settings are waiting after wake because the verified Hardware Helper is unavailable.")
             return
@@ -1227,7 +1294,22 @@ final class ThermalStore: ObservableObject {
             let maximumAttempts = Self.maximumWakeReapplyAttempts
             applyingFanIDs.insert(fanID)
             controlQueue.async {
-                let result = control.applyWithPersistentHelper(applied)
+                let result: FanControlService.ApplyResult
+                if applied.mode == .automatic {
+                    result = control.applyWithPersistentHelper(applied)
+                } else {
+                    do {
+                        try control.startWatchdog(
+                            for: applied,
+                            parentPID: ProcessInfo.processInfo.processIdentifier
+                        )
+                        result = control.applyWithPersistentHelper(applied)
+                    } catch {
+                        result = .failed(
+                            "Wake restore was blocked because a fresh crash-watchdog lease could not be armed: \(error.localizedDescription)"
+                        )
+                    }
+                }
                 var recoveryResult: FanControlService.ApplyResult?
                 let shouldRecoverAutomatically: Bool
                 switch result {
@@ -1333,7 +1415,7 @@ final class ThermalStore: ObservableObject {
                 automaticRecoveryAttempts[fanID] = 0
                 if let index = fans.firstIndex(where: { $0.id == fanID }) {
                     fans[index].controlState = .failed
-                    fans[index].lastCommand = "Wake restore failed: \(message) Automatic recovery also failed: \(recoveryMessage) The watchdog remains active while bounded recovery retries continue."
+                    fans[index].lastCommand = "Wake restore failed: \(message) Automatic recovery also failed: \(recoveryMessage) The daemon recovery supervisor remains active with backoff retries."
                 }
                 addWarning("Automatic fan recovery after wake failed and will be retried.")
                 scheduleAutomaticRecovery(
@@ -1392,12 +1474,12 @@ final class ThermalStore: ObservableObject {
 
     private func scheduleAutomaticRecovery(fanID: String, reason: String) {
         guard !applyingFanIDs.contains(fanID) else { return }
-        guard helperInstalled else {
-            addWarning("\(reason) Automatic recovery is waiting for the verified Hardware Helper.")
+        guard helperState == .ready || helperState == .recoveryBlocked else {
+            addWarning("\(reason) Automatic recovery is waiting for the authenticated Hardware Helper.")
             return
         }
-        guard var reset = lastAppliedConfigurations[fanID]
-            ?? fans.first(where: { $0.id == fanID })
+        guard lastAppliedConfigurations[fanID] != nil
+                || fans.contains(where: { $0.id == fanID })
         else {
             addWarning("\(reason) The last fan configuration is unavailable for automatic recovery.")
             return
@@ -1409,19 +1491,17 @@ final class ThermalStore: ObservableObject {
         guard attempts < Self.maximumAutomaticRecoveryAttempts else {
             if let index = fans.firstIndex(where: { $0.id == fanID }) {
                 fans[index].controlState = .failed
-                fans[index].lastCommand = "Automatic recovery reached its retry limit. The verified crash watchdog remains active; quit ThermoFan to trigger its final recovery path."
+                fans[index].lastCommand = "The UI recovery retry limit was reached. The root daemon's recovery supervisor remains active; keep the Mac awake and retry recovery before manual control."
             }
-            addWarning("Automatic fan recovery reached its retry limit; quit ThermoFan to trigger watchdog recovery.")
+            addWarning("Automatic fan recovery reached its UI retry limit; the daemon recovery supervisor remains active.")
             return
         }
         automaticRecoveryAttempts[fanID] = attempts + 1
 
-        reset.mode = .automatic
-        let automaticReset = reset
         let control = fanControl
         applyingFanIDs.insert(fanID)
         controlQueue.async {
-            let result = control.applyWithPersistentHelper(automaticReset)
+            let result = control.returnAllToAutomatic()
             Task { @MainActor [weak self] in
                 self?.finishAutomaticRecovery(
                     fanID: fanID,
@@ -1456,11 +1536,11 @@ final class ThermalStore: ObservableObject {
                 fans[index].lastCommand = "\(reason) The fan was verified back in automatic control. Review before applying manual control again."
             case .failed(let message):
                 fans[index].controlState = .failed
-                fans[index].lastCommand = "\(reason) Automatic recovery failed: \(message) The crash watchdog remains active; bounded recovery will retry."
+                fans[index].lastCommand = "\(reason) Automatic recovery failed: \(message) The daemon recovery supervisor remains active and will retry."
                 addWarning("Automatic recovery for \(fans[index].name) failed and will be retried.")
             case .recoveryRequired(let message):
                 fans[index].controlState = .failed
-                fans[index].lastCommand = "\(reason) Automatic recovery could not be verified: \(message) The crash watchdog remains active; bounded recovery will retry."
+                fans[index].lastCommand = "\(reason) Automatic recovery could not be verified: \(message) The daemon recovery supervisor remains active and will retry."
                 addWarning("Automatic recovery for \(fans[index].name) could not be verified and will be retried.")
             }
         }
@@ -1471,6 +1551,16 @@ final class ThermalStore: ObservableObject {
         guard !appWarnings.contains(message) else { return }
         appWarnings.append(message)
         warnings = warnings.filter { !appWarnings.contains($0) } + appWarnings
+    }
+
+    private func updateLegacyMigrationWarning(legacyHelperRemains: Bool? = nil) {
+        let remains = legacyHelperRemains ?? fanControl.hasLegacyPrivilegedHelper
+        if remains {
+            guard !appWarnings.contains(Self.legacyMigrationWarning) else { return }
+            appWarnings.append(Self.legacyMigrationWarning)
+        } else {
+            appWarnings.removeAll { $0 == Self.legacyMigrationWarning }
+        }
     }
 
     private func clamp(_ value: Int, min minimum: Int, max maximum: Int) -> Int {

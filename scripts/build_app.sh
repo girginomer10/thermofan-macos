@@ -4,16 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="ThermoFan"
 BUNDLE_DIR="$ROOT_DIR/dist/$APP_NAME.app"
-HELPER_SRC="$ROOT_DIR/Helpers/ThermoFanHelper/main.c"
-HELPER_POLICY_SRC="$ROOT_DIR/Sources/FanSafetyPolicy/ThermoFanSafetyPolicy.c"
-HELPER_POLICY_INCLUDE="$ROOT_DIR/Sources/FanSafetyPolicy/include"
-HELPER_BIN="$BUNDLE_DIR/Contents/Library/PrivilegedHelperTools/ThermoFanHelper"
+HELPER_BIN="$BUNDLE_DIR/Contents/MacOS/ThermoFanHelper"
+DAEMON_LABEL="io.github.girginomer10.ThermoFan.helper"
+DAEMON_PLIST_NAME="$DAEMON_LABEL.plist"
+DAEMON_PLIST="$BUNDLE_DIR/Contents/Library/LaunchDaemons/$DAEMON_PLIST_NAME"
 ICON_SOURCE="$ROOT_DIR/Resources/AppIcon.png"
 ICONSET_DIR="$ROOT_DIR/.build/ThermoFan.iconset"
-APP_VERSION="${THERMOFAN_VERSION:-0.2.6}"
-BUILD_NUMBER="${THERMOFAN_BUILD_NUMBER:-8}"
+APP_VERSION="${THERMOFAN_VERSION:-0.3.0}"
+BUILD_NUMBER="${THERMOFAN_BUILD_NUMBER:-9}"
+GIT_COMMIT="${THERMOFAN_GIT_COMMIT:-$(git -C "$ROOT_DIR" rev-parse HEAD)}"
 SIGNING_IDENTITY="${THERMOFAN_SIGNING_IDENTITY:--}"
 MINIMUM_SYSTEM_VERSION="14.0"
+IMPLEMENTATION_REVISION="$(sed -nE 's/^[[:space:]]*public static let implementationRevision = ([0-9]+)$/\1/p' "$ROOT_DIR/Sources/FanControlXPC/ThermoFanXPC.swift")"
 
 if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "THERMOFAN_VERSION must use numeric major.minor.patch format." >&2
@@ -21,6 +23,14 @@ if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 if [[ ! "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
   echo "THERMOFAN_BUILD_NUMBER must be a positive integer." >&2
+  exit 64
+fi
+if [[ ! "$GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "THERMOFAN_GIT_COMMIT must be a full lowercase Git SHA." >&2
+  exit 64
+fi
+if [[ -z "$IMPLEMENTATION_REVISION" || "$BUILD_NUMBER" != "$IMPLEMENTATION_REVISION" ]]; then
+  echo "THERMOFAN_BUILD_NUMBER must equal the Hardware Helper implementation revision ($IMPLEMENTATION_REVISION)." >&2
   exit 64
 fi
 
@@ -32,35 +42,38 @@ fi
 cd "$ROOT_DIR"
 BUILD_BIN_DIR="$(swift build -c release --arch arm64 --show-bin-path)"
 EXECUTABLE="$BUILD_BIN_DIR/$APP_NAME"
-swift build -c release --arch arm64
+HELPER_EXECUTABLE="$BUILD_BIN_DIR/ThermoFanHelper"
+swift build -c release --arch arm64 --product "$APP_NAME"
+swift build -c release --arch arm64 --product ThermoFanHelper
 
 rm -rf "$BUNDLE_DIR"
-mkdir -p "$BUNDLE_DIR/Contents/MacOS" "$BUNDLE_DIR/Contents/Resources" "$(dirname "$HELPER_BIN")"
+mkdir -p \
+  "$BUNDLE_DIR/Contents/MacOS" \
+  "$BUNDLE_DIR/Contents/Resources" \
+  "$(dirname "$DAEMON_PLIST")"
 cp "$EXECUTABLE" "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
+cp "$HELPER_EXECUTABLE" "$HELPER_BIN"
 chmod +x "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
-/usr/bin/clang -arch arm64 -mmacosx-version-min="$MINIMUM_SYSTEM_VERSION" \
-  -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 \
-  -I "$HELPER_POLICY_INCLUDE" "$HELPER_SRC" "$HELPER_POLICY_SRC" \
-  -framework IOKit -framework CoreFoundation -lproc -o "$HELPER_BIN"
 chmod +x "$HELPER_BIN"
-codesign "${SIGNING_ARGUMENTS[@]}" --identifier io.github.girginomer10.ThermoFan.helper "$HELPER_BIN" >/dev/null
 
-if [[ -f "$ICON_SOURCE" ]]; then
-  rm -rf "$ICONSET_DIR"
-  mkdir -p "$ICONSET_DIR"
-  sips -z 16 16 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_16x16.png" >/dev/null
-  sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_16x16@2x.png" >/dev/null
-  sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32.png" >/dev/null
-  sips -z 64 64 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32@2x.png" >/dev/null
-  sips -z 128 128 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128.png" >/dev/null
-  sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
-  sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256.png" >/dev/null
-  sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
-  sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512.png" >/dev/null
-  sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512@2x.png" >/dev/null
-  iconutil -c icns "$ICONSET_DIR" -o "$BUNDLE_DIR/Contents/Resources/ThermoFan.icns"
-  rm -rf "$ICONSET_DIR"
+if [[ ! -f "$ICON_SOURCE" ]]; then
+  echo "Required app icon is missing: $ICON_SOURCE" >&2
+  exit 1
 fi
+rm -rf "$ICONSET_DIR"
+mkdir -p "$ICONSET_DIR"
+sips -z 16 16 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_16x16.png" >/dev/null
+sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_16x16@2x.png" >/dev/null
+sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32.png" >/dev/null
+sips -z 64 64 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32@2x.png" >/dev/null
+sips -z 128 128 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128.png" >/dev/null
+sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
+sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256.png" >/dev/null
+sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
+sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512.png" >/dev/null
+sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512@2x.png" >/dev/null
+iconutil -c icns "$ICONSET_DIR" -o "$BUNDLE_DIR/Contents/Resources/ThermoFan.icns"
+rm -rf "$ICONSET_DIR"
 
 cat > "$BUNDLE_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -87,6 +100,8 @@ cat > "$BUNDLE_DIR/Contents/Info.plist" <<PLIST
   <string>$APP_VERSION</string>
   <key>CFBundleVersion</key>
   <string>$BUILD_NUMBER</string>
+  <key>ThermoFanGitCommit</key>
+  <string>$GIT_COMMIT</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.utilities</string>
   <key>LSMinimumSystemVersion</key>
@@ -101,7 +116,43 @@ cat > "$BUNDLE_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+cat > "$DAEMON_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$DAEMON_LABEL</string>
+  <key>BundleProgram</key>
+  <string>Contents/MacOS/ThermoFanHelper</string>
+  <key>MachServices</key>
+  <dict>
+    <key>$DAEMON_LABEL</key>
+    <true/>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>io.github.girginomer10.ThermoFan</string>
+  </array>
+</dict>
+</plist>
+PLIST
+
 printf 'APPL????' > "$BUNDLE_DIR/Contents/PkgInfo"
+plutil -lint "$BUNDLE_DIR/Contents/Info.plist" "$DAEMON_PLIST" >/dev/null
+if [[ "$(plutil -extract Label raw "$DAEMON_PLIST")" != "$DAEMON_LABEL" \
+   || "$(plutil -extract BundleProgram raw "$DAEMON_PLIST")" != "Contents/MacOS/ThermoFanHelper" \
+   || "$(/usr/libexec/PlistBuddy -c "Print :MachServices:$DAEMON_LABEL" "$DAEMON_PLIST")" != "true" ]]; then
+  echo "LaunchDaemon plist identity or BundleProgram is invalid." >&2
+  exit 1
+fi
+if [[ "$(stat -f '%Lp' "$HELPER_BIN")" != "755" ]]; then
+  echo "ThermoFanHelper must be mode 0755 with no setuid/setgid bits." >&2
+  exit 1
+fi
+codesign "${SIGNING_ARGUMENTS[@]}" --identifier "$DAEMON_LABEL" "$HELPER_BIN" >/dev/null
 codesign "${SIGNING_ARGUMENTS[@]}" --identifier io.github.girginomer10.ThermoFan "$BUNDLE_DIR" >/dev/null
 
 for executable_path in "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" "$HELPER_BIN"; do
@@ -109,7 +160,8 @@ for executable_path in "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" "$HELPER_BIN"; do
     echo "Expected an arm64-only executable: $executable_path" >&2
     exit 1
   fi
-  if [[ "$(xcrun vtool -show-build "$executable_path" | awk '$1 == "minos" { print $2; exit }')" != "$MINIMUM_SYSTEM_VERSION" ]]; then
+  BUILD_INFO="$(xcrun vtool -show-build "$executable_path")"
+  if [[ "$(awk '$1 == "minos" { print $2; exit }' <<<"$BUILD_INFO")" != "$MINIMUM_SYSTEM_VERSION" ]]; then
     echo "Expected macOS $MINIMUM_SYSTEM_VERSION deployment target: $executable_path" >&2
     exit 1
   fi

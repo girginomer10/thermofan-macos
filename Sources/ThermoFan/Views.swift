@@ -393,11 +393,22 @@ struct HelperStatusRow: View {
             Spacer(minLength: 8)
             if store.installingHelper {
                 ProgressView().controlSize(.small)
-            } else if store.helperState != .ready {
-                Button {
-                    store.installHelper()
-                } label: {
-                    Label(store.helperState == .missing ? "Install" : "Update", systemImage: "arrow.down.circle")
+            } else {
+                HStack(spacing: 8) {
+                    if store.helperState != .ready {
+                        Button {
+                            store.installHelper()
+                        } label: {
+                            Label(helperActionTitle, systemImage: helperActionSymbol)
+                        }
+                    }
+                    if [.ready, .updateRequired, .recoveryBlocked].contains(store.helperState) {
+                        Button(role: .destructive) {
+                            store.unregisterHelper()
+                        } label: {
+                            Label("Unregister", systemImage: "xmark.shield")
+                        }
+                    }
                 }
             }
         }
@@ -407,28 +418,53 @@ struct HelperStatusRow: View {
 
     private var helperTitle: String {
         switch store.helperState {
-        case .missing: "Hardware Helper not installed"
+        case .missing: "Hardware Helper not registered"
+        case .legacyCleanupRequired: "Legacy helper security upgrade required"
+        case .approvalRequired: "Administrator approval required"
         case .updateRequired: "Hardware Helper update required"
-        case .legacyCompatible: "Compatible Hardware Helper ready"
+        case .recoveryBlocked: "Hardware recovery requires attention"
         case .ready: "Hardware Helper ready"
         }
     }
 
     private var helperDetail: String {
         switch store.helperState {
-        case .missing: "Install once to control fans without repeated password prompts."
-        case .updateRequired: "Update once to enable reliable curve tracking and crash recovery."
-        case .legacyCompatible: "Fan control works now. Update once to adopt the public helper identity."
-        case .ready: "Fan writes, curve tracking, and crash recovery are available."
+        case .missing: "Register the signed macOS service once; no password is sent to ThermoFan."
+        case .legacyCleanupRequired: "Approve migration now; manual writes stay blocked until the older privileged helper is revoked and removed."
+        case .approvalRequired: "Approve ThermoFan in System Settings → General → Login Items, then retry."
+        case .updateRequired: "Install the notarized app in Applications and re-register its authenticated service."
+        case .recoveryBlocked: "Manual writes stay disabled until automatic hardware control is verified."
+        case .ready: "Authenticated fan writes, curve tracking, heartbeat, and crash recovery are available."
         }
     }
 
     private var helperSymbol: String {
         switch store.helperState {
         case .missing: "lock.shield"
+        case .legacyCleanupRequired: "exclamationmark.triangle.fill"
+        case .approvalRequired: "person.badge.shield.checkmark"
         case .updateRequired: "exclamationmark.shield.fill"
-        case .legacyCompatible: "checkmark.shield"
+        case .recoveryBlocked: "exclamationmark.triangle.fill"
         case .ready: "checkmark.shield.fill"
+        }
+    }
+
+    private var helperActionTitle: String {
+        switch store.helperState {
+        case .missing: "Register"
+        case .legacyCleanupRequired: "Secure Upgrade"
+        case .approvalRequired: "Open Settings"
+        case .updateRequired: "Update"
+        case .recoveryBlocked: "Retry Recovery"
+        case .ready: "Ready"
+        }
+    }
+
+    private var helperActionSymbol: String {
+        switch store.helperState {
+        case .approvalRequired: "gear"
+        case .legacyCleanupRequired: "lock.shield"
+        default: "arrow.down.circle"
         }
     }
 
@@ -1012,8 +1048,11 @@ struct CompactFanCard: View {
     private var applyButtonTitle: String {
         switch store.helperState {
         case .missing: "Install & Apply"
+        case .legacyCleanupRequired: "Secure Upgrade & Apply"
+        case .approvalRequired: "Approve & Apply"
         case .updateRequired: "Update & Apply"
-        case .legacyCompatible, .ready: fan.controlState == .failed ? "Retry" : "Apply"
+        case .recoveryBlocked: "Retry Recovery"
+        case .ready: fan.controlState == .failed ? "Retry" : "Apply"
         }
     }
 
@@ -1207,8 +1246,11 @@ struct FullFanCard: View {
     private var applyButtonTitle: String {
         switch store.helperState {
         case .missing: "Install Helper & Apply"
+        case .legacyCleanupRequired: "Secure Upgrade & Apply"
+        case .approvalRequired: "Approve Helper & Apply"
         case .updateRequired: "Update Helper & Apply"
-        case .legacyCompatible, .ready: fan.controlState == .failed ? "Retry Hardware Write" : "Apply to Hardware"
+        case .recoveryBlocked: "Retry Automatic Recovery"
+        case .ready: fan.controlState == .failed ? "Retry Hardware Write" : "Apply to Hardware"
         }
     }
 

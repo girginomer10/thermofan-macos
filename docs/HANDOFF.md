@@ -105,3 +105,32 @@
 - Next: Replace the legacy setuid installer with authenticated
   `SMAppService`/XPC, install a Developer ID certificate and notarize, then run
   the v8 write/sleep/force-quit acceptance matrix on physical M1-M5 models.
+
+## 2026-08-28 00:24 +03 - Codex
+
+- Task: Complete the direct-distribution architecture and close the protocol 8
+  privileged-helper risks before an M-series public release.
+- Changed: Replaced the setuid/CLI helper with an embedded protocol 9
+  `SMAppService` LaunchDaemon and mutually authenticated NSXPC boundary; added
+  exact-process watchdog and heartbeat leases, durable fail-closed Auto
+  recovery, stable update/unregister recovery, automatic legacy-helper
+  retirement, registration/approval/recovery UI states, and an arm64
+  Developer ID/notarized-DMG release pipeline with SHA-bound evidence. CI now
+  covers arm64 macOS 14, 15, and 26 and pins third-party actions by commit.
+- Verified: `swift test` (54 passed), production app/helper build, strict Swift/C
+  warning and analyzer checks, strict app/helper code-signature checks,
+  Hardened Runtime, arm64-only binaries, macOS 14 deployment targets, mode
+  `0755` with no setuid/setgid files, exact LaunchDaemon metadata, absence of
+  both app/helper legacy command surfaces, and a read-only Mac16,11 M4 Pro
+  diagnostic (22 sensors, one `F0Md` fan in Auto). Final adversarial reviews
+  reported no remaining P0/P1/P2 findings. No root service registration or
+  physical fan write was performed.
+- Memory: Never accept a manual-write lease without an exact PID/start-time
+  watcher; scope asynchronous replies to their connection generation; keep
+  legacy migration and service removal behind independently stable Auto proof;
+  release provenance must be rechecked after build and before artifact export.
+- Next: Install the Developer ID Application identity and Keychain notary
+  profile, produce and Gatekeeper-test the public candidate on a clean Mac, then
+  complete physical write/recovery acceptance across M1-M5 models. Move the
+  macOS 14 minimum-runtime gate to a physical/self-hosted runner before GitHub's
+  hosted image retires on 2026-11-02.

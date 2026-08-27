@@ -15,13 +15,25 @@ you understand the tradeoffs and can observe the machine during initial tests.
 - The legacy `FS!` force mask is not guessed as an Apple Silicon fallback.
 - The target and mode are read back before success is reported.
 - A failed write attempts to restore automatic control.
-- If that rollback cannot be verified, the helper returns a distinct recovery
-  result; the app performs at most three verified Auto retries while the
-  pre-started watchdog remains alive.
-- A privileged watchdog must prove it is observing the app before the first
-  manual write; normal quit and the watchdog restore automatic control.
-- Root-owned recovery state binds each claimed fan to both the app PID and its
-  process start time, so PID reuse cannot transfer watchdog authority.
+- If that rollback cannot be verified, the daemon returns a distinct recovery
+  result, blocks new manual writes, and keeps a backoff Auto-recovery supervisor
+  active until hardware recovery is verified.
+- The mutually authenticated daemon must synchronously arm an exact-process
+  exit watch before the first manual write. A 2-second app heartbeat has an
+  8-second lease timeout.
+- XPC loss, process exit, heartbeat expiry, active-console-user change, daemon
+  `SIGTERM`/`SIGINT`, and daemon startup all trigger Auto recovery.
+- Root-owned recovery state is written atomically and binds each claimed fan to
+  both the authenticated app PID and its process start time, so PID reuse cannot
+  transfer watchdog authority.
+- Only the active local graphical console user's UID and audit session may hold
+  a fan-control lease.
+- App and daemon mutually require the exact Developer ID identifier and Team
+  ID; ad-hoc builds are monitoring-only.
+- The helper is an embedded `SMAppService` LaunchDaemon with mode `0755`; no
+  setuid or legacy command-line fallback can perform a write.
+- Earlier exact helper inodes are deprivileged and removed, their running
+  processes are drained, and Auto is checked again before manual writes open.
 - Sleep/wake sampling is serialized, stale pre-wake results are discarded, and
   a lost control interface triggers verified automatic recovery with retries.
 - Curve temperatures and RPM values are normalized into monotonic order.
@@ -32,8 +44,8 @@ you understand the tradeoffs and can observe the machine during initial tests.
 - Apple's SMC interface is private and undocumented.
 - A familiar SMC key can behave differently on another model or macOS release.
 - Target read-back confirms the requested value, not immediate physical RPM.
-- The verified watchdog and quit handler are still software recovery paths, not
-  a firmware-level guarantee.
+- The watchdog, heartbeat, connection, signal, and startup handlers are still
+  software recovery paths, not a firmware-level guarantee.
 - Apple firmware mode value `3` means system control, not manual control.
 - Fixed RPM can be too low for a workload even when it is inside the hardware
   range.
@@ -56,8 +68,9 @@ Do not use early tests on an unattended Mac or during critical work.
 ## Emergency Return to Automatic Control
 
 Use **Return to Auto** in the Fans pane. If the UI is unavailable, quit
-ThermoFan so the watchdog can attempt recovery. Rebooting normally returns SMC
-fan policy to firmware control, but behavior remains model-dependent.
+ThermoFan; connection loss, process exit, or heartbeat expiry tells the root
+daemon to attempt recovery. Rebooting normally returns SMC fan policy to
+firmware control, but behavior remains model-dependent.
 
 When reporting a safety issue, include the Mac model, chip, macOS version,
 ThermoFan version, fan range, requested target, observed target, observed

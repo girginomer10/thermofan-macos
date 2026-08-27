@@ -1,7 +1,8 @@
 # Architecture
 
-ThermoFan is a SwiftUI menu bar application with a small C helper for privileged
-SMC fan writes. All sensor processing and persistence stay on the local Mac.
+ThermoFan is a SwiftUI menu bar application with an embedded, root
+`SMAppService` LaunchDaemon for privileged SMC fan writes. Sensor processing,
+preferences, and diagnostics stay on the local Mac.
 
 ## Components
 
@@ -9,15 +10,14 @@ SMC fan writes. All sensor processing and persistence stay on the local Mac.
 | --- | --- |
 | `ThermoFanApp.swift` | App lifecycle, settings window, menu bar scene |
 | `ThermalStore.swift` | Application state, refresh loop, curves, presets, recovery |
-| `HardwareProbe.swift` | Hardware discovery, persistence, helper installation and invocation |
+| `HardwareProbe.swift` | Hardware and temperature discovery |
 | `HardwareCompatibility.swift` | Capability policy and model-independent sensor candidates |
-| `SMCClient.swift` | Typed reads and writes through AppleSMC IOKit user client |
-| `HIDTemperatureReader.swift` | Apple PMU/HID temperature discovery |
-| `FanCurveMath.swift` | Curve normalization and interpolation |
-| `Models.swift` | Persisted and runtime domain models |
-| `Views.swift` | Menu bar and settings UI |
-| `CommandLineEntrypoint.swift` | Read-only diagnostics |
-| `ThermoFanHelper/main.c` | Bounded privileged fan commands and watchdog |
+| `SMCClient.swift` | User-process typed reads through AppleSMC |
+| `FanControlService.swift` | Application-facing privileged-control facade |
+| `PrivilegedFanClient.swift` | `SMAppService` lifecycle, mutually authenticated NSXPC, heartbeat lease |
+| `ThermoFanXPC.swift` | Narrow protocol 9 contract and Developer ID requirements |
+| `ThermoFanHelper/main.swift` | Root daemon sessions, peer policy, watchdogs, recovery |
+| `ThermoFanEngine.c` | Serialized SMC writes, read-back, atomic ownership state |
 
 ## Read Path
 
@@ -36,76 +36,103 @@ by default.
 ## Write Path
 
 1. The user stages automatic, fixed, or curve mode in the UI.
-2. `ThermalStore` snapshots the staged fan setting away from the main actor.
-3. Before any manual write, `FanControlService` starts a privileged watchdog,
-   waits for its exact readiness handshake, and retains the live process.
-4. `FanControlService` invokes the installed helper with a fan index, mode, and
-   optional integer RPM.
-5. The helper validates the fan index and mode, reads the hardware RPM range,
-   and clamps the target.
-6. The helper tries `F{i}Md`, then `F{i}md`; without a verified per-fan mode
-   key, the fan remains monitoring-only rather than falling back to `FS!`.
-7. Manual mode is written and polled before the target is written.
-8. Target and mode are read back. A mismatch restores automatic mode.
-9. Only a verified result becomes active application state.
+2. The app requires the embedded LaunchDaemon to be registered, approved, and
+   running from a Developer ID signed app in `/Applications`.
+3. App and daemon authenticate each other over NSXPC with the exact bundle
+   identifier and the same Developer ID Team ID. Debug-signed peers are denied.
+4. The daemon accepts only the active local graphical console user's kernel
+   supplied UID, audit session, PID, and process start identity.
+5. Before a manual write is acknowledged, the daemon arms an exact-process
+   exit watch and the app starts its heartbeat lease.
+6. The daemon validates the protocol version, fan index, mode, RPM envelope,
+   session ownership, and monotonically increasing request revision.
+7. The C engine serializes the transaction, reads the hardware RPM range, and
+   discovers `F{i}Md` followed by `F{i}md`. It never falls back to `FS!`.
+8. Manual mode is verified before target RPM is written; mode and target are
+   read back before success is reported. A mismatch starts Auto recovery.
 
-No arbitrary SMC key, file path, command, or shell fragment can be supplied
-through the helper's command-line interface.
+The XPC protocol accepts only handshake, watchdog, heartbeat, bounded fan
+operation, and return-all-to-Auto messages. It accepts no arbitrary SMC key,
+file path, command, or shell fragment.
 
-## Helper Lifecycle
+## Hardware Helper Lifecycle
 
-The bundled helper is ad-hoc signed as part of the local build. Its installer:
+The release bundle contains:
 
-- rejects non-regular or group/other-writable bundled files;
-- validates the bundled code signature;
-- stages a root-owned copy;
-- validates the staged signature and helper version;
-- moves it to the final path with mode `4755`;
-- records a root-owned version marker;
-- removes the legacy helper path.
+```text
+Contents/MacOS/ThermoFanHelper
+Contents/Library/LaunchDaemons/io.github.girginomer10.ThermoFan.helper.plist
+```
 
-A root-owned v8 helper at the legacy path can be migrated after its permissions
-and version marker are validated. Older v4-v7 protocols are not allowed to
-write against the expanded M-series matrix and must update first.
+The plist uses `BundleProgram`, exposes the same identifier as its privileged
+Mach service, and is registered through `SMAppService.daemon(plistName:)`.
+macOS requires administrator approval under **System Settings > General > Login
+Items**. The executable remains inside the app bundle with mode `0755`; no
+setuid or separately copied helper is used.
 
-The current implementation uses a narrowly scoped setuid helper so repeated fan
-changes do not require repeated administrator prompts. Replacing it with an
-embedded, authenticated `SMAppService` LaunchDaemon/XPC helper is a mandatory
-gate before a public binary release; notarization alone is not a security
-architecture review.
+An update first tries the normal versioned handshake. Protocol 9 and later also
+retain a stable, version-independent harmless recovery handshake plus
+`prepareForServiceRemoval`. The former authenticates the permanent protocol-9
+floor before the latter blocks writes, verifies Auto, and permits
+`SMAppService` unregister/re-register. If that proof is unavailable, the old
+daemon is left registered and new writes remain blocked.
+
+On startup, protocol 9 first recovers durable ownership to Auto. It then revokes
+setuid/setgid and execute bits on only four exact, verified root-owned legacy
+inodes, unlinks and fsyncs them, waits for exact-path legacy processes to exit,
+and performs a final Auto recovery. Manual writes use a separate readiness gate
+that opens only after this whole barrier succeeds. There is no legacy
+command-line or setuid fallback.
+
+Ad-hoc builds have no Developer ID Team ID and are intentionally
+monitoring-only. This keeps local development from weakening the production
+peer requirements.
 
 ## Recovery
 
-- Normal quit requests automatic mode for active hardware-controlled fans.
-- A detached helper proves it is watching the launching app before manual
-  control begins and restores only fan bits owned by that exact PID and process
-  start identity if it exits.
-- A failed fixed or curve write restores automatic mode before returning.
-- An unverified rollback has a dedicated helper exit/result path and starts a
-  bounded in-process Auto retry sequence without discarding watchdog ownership.
-- On wake, stale pre-wake samples are discarded; active curve or fixed settings
-  are retried within a bound, then verified back to automatic control on error.
-- If a live fan loses its verified write interface, the UI leaves the active
-  state and automatic recovery is retried while manual writes remain disabled.
+The daemon returns its durably owned fans to Auto when any of these occurs:
+
+- explicit Return to Auto or normal app shutdown;
+- XPC interruption or invalidation;
+- exact client-process exit;
+- missed heartbeat (2-second interval, 8-second lease timeout);
+- active console user or graphical audit-session change;
+- daemon `SIGTERM` or `SIGINT`;
+- daemon startup with existing ownership state;
+- a failed or unverified write.
+
+Ownership is stored in a root-only state file under `/var/run` and atomically
+replaced with `fsync` before a write can be accepted. It binds the claimed fan
+mask to the authenticated PID and process start time, preventing PID reuse from
+transferring authority. A recovery result that cannot be verified blocks new
+manual writes. The daemon keeps an independent backoff recovery supervisor
+active until Auto is verified; UI retries are separately bounded.
 
 Recovery is best-effort because macOS, SMC firmware, power loss, and forced
-process termination can interrupt any software path.
+termination can interrupt any software path.
 
 ## Persistence
 
-`PersistenceController` atomically writes JSON to:
+`PersistenceController` atomically writes user preferences to:
 
 ```text
 ~/Library/Application Support/ThermoFan/state.json
 ```
 
 The file stores preferences, presets, sensor visibility, staged fan settings,
-and custom indexes. It contains no credentials.
+and custom indexes. It contains no credentials. Privileged ownership state is
+separate, root-only, and contains no account credentials.
 
 ## Trust Boundaries
 
-- The SwiftUI process runs as the logged-in user.
-- Administrator authorization is used only to install or update the helper.
-- The installed helper is root-owned and accepts a fixed argument grammar.
-- Hardware writes rely on private Apple interfaces and must be treated as
-  model-specific even when key names match.
+- The SwiftUI process runs as the logged-in user and performs monitoring.
+- launchd runs the embedded Hardware Helper as root after macOS approval.
+- Both peers enforce `anchor apple generic`, the exact expected identifier,
+  Developer ID certificate markers, the same Team ID, and absence of
+  `get-task-allow`.
+- The daemon separately requires the active local graphical console UID and a
+  non-root, non-remote audit session.
+- The daemon derives PID, UID, and audit-session data from NSXPC; callers do not
+  submit their own identity.
+- Hardware writes use private Apple interfaces and remain model-specific even
+  when key names match.
