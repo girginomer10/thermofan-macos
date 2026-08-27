@@ -8,4 +8,10 @@ final class HardwareHelperStateTests: XCTestCase {
         XCTAssertTrue(HardwareHelperState.legacyCompatible.isUsable)
         XCTAssertTrue(HardwareHelperState.ready.isUsable)
     }
+
+    func testProcessIdentitySafetyRequiresV8ForEveryHelperPath() {
+        XCTAssertEqual(FanControlService.expectedHelperVersion, "8")
+        XCTAssertEqual(FanControlService.compatibleLegacyHelperVersion, "8")
+        XCTAssertEqual(FanControlService.watchdogReadyPrefix, "THERMOFAN_WATCHDOG_READY_V8")
+    }
 }

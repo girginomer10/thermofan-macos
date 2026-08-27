@@ -11,6 +11,11 @@ let package = Package(
         .executable(name: "ThermoFan", targets: ["ThermoFan"])
     ],
     targets: [
+        .target(
+            name: "FanSafetyPolicy",
+            path: "Sources/FanSafetyPolicy",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "ThermoFan",
             linkerSettings: [
@@ -20,7 +25,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ThermoFanTests",
-            dependencies: ["ThermoFan"]
+            dependencies: ["ThermoFan", "FanSafetyPolicy"]
         )
     ]
 )

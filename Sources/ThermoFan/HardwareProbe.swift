@@ -1,3 +1,5 @@
+import Darwin
+import Dispatch
 import Foundation
 import Security
 
@@ -78,12 +80,20 @@ final class FanControlService: @unchecked Sendable {
         "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper",
         "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper.version"
     ]
-    private static let expectedHelperVersion = "5"
-    private static let compatibleLegacyHelperVersion = "4"
+    static let expectedHelperVersion = "8"
+    static let watchdogReadyPrefix = "THERMOFAN_WATCHDOG_READY_V8"
+    private static let watchdogReadyTimeoutMilliseconds: Int32 = 3_000
+    static let recoveryRequiredExitCode: Int32 = 75
+    // Only the current protocol may write on the expanded M-series matrix.
+    // A v8 binary at the old path remains migratable; earlier protocols must update first.
+    static let compatibleLegacyHelperVersion = "8"
+    private let watchdogLock = NSLock()
+    private var watchdogProcesses: [Int: Process] = [:]
 
     enum ApplyResult {
         case applied(String)
         case failed(String)
+        case recoveryRequired(String)
     }
 
     var persistentHelperState: HardwareHelperState {
@@ -161,7 +171,39 @@ final class FanControlService: @unchecked Sendable {
             guard isPersistentHelperInstalled else {
                 throw FanControlError.helperMissing
             }
-            return .applied(try runPersistentHelper(for: fan))
+            guard let fanIndex = Self.fanIndex(from: fan.id) else {
+                throw FanControlError.invalidFanIdentifier(fan.id)
+            }
+            if fan.mode != .automatic, !hasRunningWatchdog(for: fanIndex) {
+                throw FanControlError.processFailed(
+                    "Hardware write was blocked because no verified crash watchdog is running for fan \(fanIndex + 1)."
+                )
+            }
+            let rpm = fan.mode == .automatic ? nil : fan.targetRPM
+            return .applied(try runPersistentHelper(fanIndex: fanIndex, mode: fan.mode, rpm: rpm))
+        } catch FanControlError.recoveryRequired(let message) {
+            return .recoveryRequired("Hardware recovery required: \(message)")
+        } catch {
+            return .failed("Hardware write failed: \(Self.describe(error))")
+        }
+    }
+
+    func applyCommandWithPersistentHelper(fanIndex: Int, mode: FanMode, rpm: Int?) -> ApplyResult {
+        do {
+            guard isPersistentHelperInstalled else {
+                throw FanControlError.helperMissing
+            }
+            guard (0...7).contains(fanIndex) else {
+                throw FanControlError.invalidFanIdentifier("fan\(fanIndex)")
+            }
+            guard mode == .automatic, rpm == nil else {
+                throw FanControlError.processFailed(
+                    "Fixed and curve one-shot commands are disabled because they cannot guarantee a verified crash watchdog. Use the ThermoFan app instead."
+                )
+            }
+            return .applied(try runPersistentHelper(fanIndex: fanIndex, mode: mode, rpm: rpm))
+        } catch FanControlError.recoveryRequired(let message) {
+            return .recoveryRequired("Hardware recovery required: \(message)")
         } catch {
             return .failed("Hardware write failed: \(Self.describe(error))")
         }
@@ -174,110 +216,96 @@ final class FanControlService: @unchecked Sendable {
         guard let fanIndex = Self.fanIndex(from: fan.id) else {
             throw FanControlError.invalidFanIdentifier(fan.id)
         }
-        try Self.runDetachedProcess(
-            executable: helperPath,
-            arguments: ["--watch", "\(parentPID)", "\(fanIndex)"]
-        )
-    }
-
-    func applyDirect(fanIndex: Int, mode: FanMode, rpm: Int?) throws -> String {
-        let smc = try SMCClient()
-        let fanCount = Int(try smc.readNumber(key: "FNum").value)
-        guard fanIndex >= 0, fanIndex < fanCount else {
-            throw FanControlError.noSuchFan(fanIndex: fanIndex, count: fanCount)
+        guard parentPID == ProcessInfo.processInfo.processIdentifier else {
+            throw FanControlError.processFailed("The crash watchdog may only monitor the current ThermoFan process.")
         }
 
-        let prefix = "F\(fanIndex)"
-        let minRPM = Int(try smc.readNumber(key: "\(prefix)Mn").value)
-        let maxRPM = Int(try smc.readNumber(key: "\(prefix)Mx").value)
-        guard minRPM >= 0, maxRPM > minRPM, maxRPM >= 1000 else {
-            throw FanControlError.unreadableFanRange(fanIndex: fanIndex)
+        watchdogLock.lock()
+        defer { watchdogLock.unlock() }
+        if let existing = watchdogProcesses[fanIndex], existing.isRunning {
+            return
         }
-        let clampedRPM = max(minRPM, min(rpm ?? minRPM, maxRPM))
-        let perFanModeKey = "\(prefix)Md"
-        let supportsPerFanMode = (try? smc.readNumber(key: perFanModeKey)) != nil
+        watchdogProcesses.removeValue(forKey: fanIndex)
 
-        switch mode {
-        case .automatic:
-            if supportsPerFanMode {
-                try smc.writeNumber(key: perFanModeKey, value: 0)
-                let verifiedMode = try smc.readNumber(key: perFanModeKey).value
-                guard verifiedMode < 0.5 else {
-                    throw FanControlError.verificationFailed("SMC still reports manual mode for fan \(fanIndex + 1).")
-                }
-                return "Fan \(fanIndex + 1) returned to automatic hardware control."
-            }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: helperPath)
+        process.arguments = ["--watch", "\(parentPID)", "\(fanIndex)"]
+        process.standardInput = FileHandle.nullDevice
 
-            var forceMask = Int(try smc.readNumber(key: "FS! ").value)
-            forceMask &= ~(1 << fanIndex)
-            try smc.writeNumber(key: "FS! ", value: Double(forceMask))
-            let verifiedMask = Int(try smc.readNumber(key: "FS! ").value)
-            guard (verifiedMask & (1 << fanIndex)) == 0 else {
-                throw FanControlError.verificationFailed("The SMC force mask still includes fan \(fanIndex + 1).")
-            }
-            return "Fan \(fanIndex + 1) returned to automatic hardware control."
-        case .fixed, .curve:
-            if supportsPerFanMode {
-                try smc.writeNumber(key: perFanModeKey, value: 1)
-            } else {
-                var forceMask = Int(try smc.readNumber(key: "FS! ").value)
-                forceMask |= (1 << fanIndex)
-                try smc.writeNumber(key: "FS! ", value: Double(forceMask))
+        let readinessPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = readinessPipe
+        process.standardError = errorPipe
+
+        var didLaunch = false
+        do {
+            try process.run()
+            didLaunch = true
+            try? readinessPipe.fileHandleForWriting.close()
+            try? errorPipe.fileHandleForWriting.close()
+
+            let readiness = try Self.readWatchdogReadiness(
+                from: readinessPipe.fileHandleForReading,
+                timeoutMilliseconds: Self.watchdogReadyTimeoutMilliseconds
+            )
+            let expected = "\(Self.watchdogReadyPrefix) pid=\(parentPID) fan=\(fanIndex)"
+            guard readiness == expected, process.isRunning else {
+                throw FanControlError.processFailed("The privileged watchdog returned an invalid readiness handshake.")
             }
 
-            do {
-                try smc.writeNumber(key: "\(prefix)Tg", value: Double(clampedRPM))
-                let appliedRPM = try smc.readNumber(key: "\(prefix)Tg").value
-                guard abs(appliedRPM - Double(clampedRPM)) <= 25 else {
-                    throw FanControlError.verificationFailed(
-                        "Requested \(clampedRPM) RPM, but SMC reports \(Int(appliedRPM.rounded())) RPM."
-                    )
+            try? readinessPipe.fileHandleForReading.close()
+            try? errorPipe.fileHandleForReading.close()
+            watchdogProcesses[fanIndex] = process
+        } catch {
+            var detail = Self.describe(error)
+            if didLaunch, !process.isRunning {
+                process.waitUntilExit()
+                let errorOutput = String(
+                    data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+                    encoding: .utf8
+                )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !errorOutput.isEmpty {
+                    detail = errorOutput
                 }
-                if supportsPerFanMode {
-                    let verifiedMode = try smc.readNumber(key: perFanModeKey).value
-                    guard verifiedMode >= 0.5 else {
-                        throw FanControlError.verificationFailed("SMC did not retain manual mode for fan \(fanIndex + 1).")
-                    }
-                } else {
-                    let verifiedMask = Int(try smc.readNumber(key: "FS! ").value)
-                    guard (verifiedMask & (1 << fanIndex)) != 0 else {
-                        throw FanControlError.verificationFailed("The SMC force mask does not include fan \(fanIndex + 1).")
-                    }
-                }
-                return "Fan \(fanIndex + 1) target verified on hardware: \(Int(appliedRPM.rounded())) RPM."
-            } catch {
-                if supportsPerFanMode {
-                    try? smc.writeNumber(key: perFanModeKey, value: 0)
-                } else if var forceMask = try? Int(smc.readNumber(key: "FS! ").value) {
-                    forceMask &= ~(1 << fanIndex)
-                    try? smc.writeNumber(key: "FS! ", value: Double(forceMask))
-                }
-                throw error
             }
+            if didLaunch, process.isRunning {
+                process.terminate()
+            }
+            try? readinessPipe.fileHandleForReading.close()
+            try? readinessPipe.fileHandleForWriting.close()
+            try? errorPipe.fileHandleForReading.close()
+            try? errorPipe.fileHandleForWriting.close()
+            throw FanControlError.processFailed("Crash watchdog did not become ready: \(detail)")
         }
     }
 
-    private func applyDirect(fan: FanDevice) throws -> String {
-        guard let fanIndex = Self.fanIndex(from: fan.id) else {
-            throw FanControlError.invalidFanIdentifier(fan.id)
+    private func hasRunningWatchdog(for fanIndex: Int) -> Bool {
+        watchdogLock.lock()
+        defer { watchdogLock.unlock() }
+        guard let process = watchdogProcesses[fanIndex], process.isRunning else {
+            watchdogProcesses.removeValue(forKey: fanIndex)
+            return false
         }
-        let rpm = fan.mode == .automatic ? nil : fan.targetRPM
-        return try applyDirect(fanIndex: fanIndex, mode: fan.mode, rpm: rpm)
+        return true
     }
 
-    private func runPersistentHelper(for fan: FanDevice) throws -> String {
+    private func runPersistentHelper(fanIndex: Int, mode: FanMode, rpm: Int?) throws -> String {
         guard let helperPath = activeHelperPath else {
             throw FanControlError.helperMissing
         }
-        guard let fanIndex = Self.fanIndex(from: fan.id) else {
-            throw FanControlError.invalidFanIdentifier(fan.id)
-        }
-        var arguments = ["--fanctl", "\(fanIndex)", fan.mode.rawValue]
-        if fan.mode != .automatic {
-            arguments.append("\(fan.targetRPM)")
+        var arguments = ["--fanctl", "\(fanIndex)", mode.rawValue]
+        if mode != .automatic {
+            guard let rpm else {
+                throw FanControlError.processFailed("RPM is required for fixed or curve mode.")
+            }
+            arguments.append("\(rpm)")
         }
 
-        let output = try Self.runProcess(executable: helperPath, arguments: arguments)
+        let output = try Self.runProcess(
+            executable: helperPath,
+            arguments: arguments,
+            recoveryExitCode: Self.recoveryRequiredExitCode
+        )
         return output.isEmpty ? "Hardware command applied." : output
     }
 
@@ -395,7 +423,11 @@ final class FanControlService: @unchecked Sendable {
         return String(describing: error)
     }
 
-    private static func runProcess(executable: String, arguments: [String]) throws -> String {
+    private static func runProcess(
+        executable: String,
+        arguments: [String],
+        recoveryExitCode: Int32? = nil
+    ) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -414,21 +446,93 @@ final class FanControlService: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         guard process.terminationStatus == 0 else {
-            throw FanControlError.processFailed(errorOutput.isEmpty ? output : errorOutput)
+            throw classifyProcessFailure(
+                status: process.terminationStatus,
+                output: output,
+                errorOutput: errorOutput,
+                recoveryExitCode: recoveryExitCode
+            )
         }
 
         return output
     }
 
-    private static func runDetachedProcess(executable: String, arguments: [String]) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        let null = FileHandle(forWritingAtPath: "/dev/null")
-        process.standardOutput = null
-        process.standardError = null
-        process.standardInput = FileHandle.nullDevice
-        try process.run()
+    static func classifyProcessFailure(
+        status: Int32,
+        output: String,
+        errorOutput: String,
+        recoveryExitCode: Int32?
+    ) -> FanControlError {
+        let message = errorOutput.isEmpty ? output : errorOutput
+        if let recoveryExitCode, status == recoveryExitCode {
+            return .recoveryRequired(
+                message.isEmpty
+                    ? "Automatic fan recovery could not be verified."
+                    : message
+            )
+        }
+        return .processFailed(message)
+    }
+
+    private static func readWatchdogReadiness(
+        from handle: FileHandle,
+        timeoutMilliseconds: Int32
+    ) throws -> String {
+        let descriptor = handle.fileDescriptor
+        let timeoutNanoseconds = UInt64(timeoutMilliseconds) * 1_000_000
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ timeoutNanoseconds
+        var received = Data()
+
+        while !received.contains(0x0a), received.count < 256 {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now < deadline else {
+                throw FanControlError.processFailed("Timed out waiting for the privileged watchdog readiness signal.")
+            }
+            let remainingNanoseconds = deadline - now
+            let remainingMilliseconds = max(
+                1,
+                min(Int32.max, Int32(remainingNanoseconds / 1_000_000))
+            )
+            var pollDescriptor = pollfd(
+                fd: descriptor,
+                events: Int16(POLLIN | POLLHUP),
+                revents: 0
+            )
+            let pollResult = Darwin.poll(&pollDescriptor, 1, remainingMilliseconds)
+            if pollResult < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw FanControlError.processFailed("Could not read the privileged watchdog readiness signal.")
+            }
+            guard pollResult > 0 else {
+                throw FanControlError.processFailed("Timed out waiting for the privileged watchdog readiness signal.")
+            }
+            if (pollDescriptor.revents & Int16(POLLERR | POLLNVAL)) != 0 {
+                throw FanControlError.processFailed("The privileged watchdog readiness pipe failed.")
+            }
+
+            var buffer = [UInt8](repeating: 0, count: 128)
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw FanControlError.processFailed("Could not read the privileged watchdog readiness signal.")
+            }
+            guard count > 0 else { break }
+            received.append(contentsOf: buffer.prefix(Int(count)))
+        }
+
+        guard
+            let newline = received.firstIndex(of: 0x0a),
+            let readiness = String(data: received[..<newline], encoding: .utf8)
+        else {
+            throw FanControlError.processFailed("The privileged watchdog did not return a complete readiness signal.")
+        }
+        return readiness
     }
 
     private static func shellQuoted(_ value: String) -> String {
@@ -441,24 +545,18 @@ final class FanControlService: @unchecked Sendable {
 
     enum FanControlError: Error, LocalizedError {
         case invalidFanIdentifier(String)
-        case noSuchFan(fanIndex: Int, count: Int)
-        case unreadableFanRange(fanIndex: Int)
         case helperMissing
-        case verificationFailed(String)
+        case recoveryRequired(String)
         case processFailed(String)
 
         var errorDescription: String? {
             switch self {
             case .invalidFanIdentifier(let id):
                 return "Invalid fan identifier '\(id)'."
-            case .noSuchFan(let fanIndex, let count):
-                return "Fan \(fanIndex + 1) does not exist; SMC reports \(count) fan(s)."
-            case .unreadableFanRange(let fanIndex):
-                return "Fan \(fanIndex + 1) RPM range could not be read safely from SMC."
             case .helperMissing:
                 return "Hardware Helper is not installed."
-            case .verificationFailed(let message):
-                return "Hardware verification failed: \(message)"
+            case .recoveryRequired(let message):
+                return message.isEmpty ? "Automatic fan recovery is required." : message
             case .processFailed(let message):
                 return message.isEmpty ? "The privileged command failed." : message
             }
@@ -467,14 +565,8 @@ final class FanControlService: @unchecked Sendable {
 }
 
 final class HardwareProbe: @unchecked Sendable {
-    private struct SensorDefinition {
-        var key: String
-        var name: String
-        var category: SensorCategory
-    }
-
-    private let smc: SMCClient?
-    private let hidReader = HIDTemperatureReader()
+    private let smc: (any SMCReadingProviding)?
+    private let hidReader: any HIDTemperatureReadingProviding
 
     // Model identifier, chip name, and OS version never change while the app
     // runs, so resolve them once instead of spawning sw_vers on every sample.
@@ -484,6 +576,7 @@ final class HardwareProbe: @unchecked Sendable {
 
     init() {
         smc = try? SMCClient()
+        hidReader = HIDTemperatureReader()
         modelIdentifier = Self.sysctlString("hw.model") ?? "Unknown Mac"
         chipName = Self.sysctlString("machdep.cpu.brand_string") ?? "Apple Silicon"
         let version = ProcessInfo.processInfo.operatingSystemVersion
@@ -491,8 +584,26 @@ final class HardwareProbe: @unchecked Sendable {
         osVersion = "macOS \(version.majorVersion).\(version.minorVersion)\(patch)"
     }
 
+    init(
+        smc: (any SMCReadingProviding)?,
+        hidReader: any HIDTemperatureReadingProviding,
+        modelIdentifier: String,
+        chipName: String,
+        osVersion: String
+    ) {
+        self.smc = smc
+        self.hidReader = hidReader
+        self.modelIdentifier = modelIdentifier
+        self.chipName = chipName
+        self.osVersion = osVersion
+    }
+
     var isSMCAvailable: Bool {
         smc != nil
+    }
+
+    func prepareAfterWake() {
+        smc?.resetCacheAfterWake()
     }
 
     func sample(preferences: AppPreferences) -> HardwareSnapshot {
@@ -501,7 +612,18 @@ final class HardwareProbe: @unchecked Sendable {
         let smcSensors = readSMCSensors()
         let systemSensors = hidReader.readSensors()
         var sensors = smcSensors
-        let fans = readSMCFans()
+        let fanDiscovery = readSMCFans()
+        let fans = fanDiscovery.fans
+        if let warning = fanDiscovery.warning {
+            warnings.append(warning)
+        }
+
+        let monitoringOnlyCount = fans.filter { !$0.controlInterface.isAvailable }.count
+        if monitoringOnlyCount > 0 {
+            warnings.append(
+                "\(monitoringOnlyCount) fan\(monitoringOnlyCount == 1 ? "" : "s") detected, but this firmware exposes no verified fan-control interface. ThermoFan will monitor without writing."
+            )
+        }
 
         if smcSensors.isEmpty, !systemSensors.isEmpty {
             sensors = systemSensors
@@ -526,106 +648,40 @@ final class HardwareProbe: @unchecked Sendable {
 
     private func readSMCSensors() -> [ThermalSensor] {
         guard let smc else { return [] }
-        var definitions: [SensorDefinition] = [
-            SensorDefinition(key: "TA0P", name: "Airport Proximity", category: .ambient),
-            SensorDefinition(key: "TA0p", name: "Ambient Proximity", category: .ambient),
-            SensorDefinition(key: "Ta0p", name: "Ambient Proximity", category: .ambient),
-            SensorDefinition(key: "TCMz", name: "CPU Die Hotspot", category: .cpu),
-            SensorDefinition(key: "TCMb", name: "CPU Core Max", category: .cpu),
-            SensorDefinition(key: "TC0P", name: "CPU Proximity", category: .cpu),
-            SensorDefinition(key: "TC0E", name: "CPU PECI", category: .cpu),
-            SensorDefinition(key: "TC0F", name: "CPU Controller", category: .cpu),
-            SensorDefinition(key: "TC0H", name: "CPU Heatsink", category: .cpu),
-            SensorDefinition(key: "TC0D", name: "CPU Diode", category: .cpu),
-            SensorDefinition(key: "TC1C", name: "CPU Core 1", category: .cpu),
-            SensorDefinition(key: "TC2C", name: "CPU Core 2", category: .cpu),
-            SensorDefinition(key: "TC3C", name: "CPU Core 3", category: .cpu),
-            SensorDefinition(key: "TC4C", name: "CPU Core 4", category: .cpu),
-            SensorDefinition(key: "Te04", name: "CPU Efficiency Sensor 1", category: .cpu),
-            SensorDefinition(key: "Te05", name: "CPU Efficiency Sensor 2", category: .cpu),
-            SensorDefinition(key: "Te06", name: "CPU Efficiency Sensor 3", category: .cpu),
-            SensorDefinition(key: "TG0P", name: "GPU Proximity", category: .gpu),
-            SensorDefinition(key: "TG0D", name: "GPU Diode", category: .gpu),
-            SensorDefinition(key: "TG0H", name: "GPU Heatsink", category: .gpu),
-            SensorDefinition(key: "Tg05", name: "GPU Cluster 1", category: .gpu),
-            SensorDefinition(key: "Tg0S", name: "GPU Cluster 2", category: .gpu),
-            SensorDefinition(key: "Tg0Y", name: "GPU Cluster 3", category: .gpu),
-            SensorDefinition(key: "Tg0k", name: "GPU Cluster 4", category: .gpu),
-            SensorDefinition(key: "Tg0z", name: "GPU Cluster 5", category: .gpu),
-            SensorDefinition(key: "Tg0a", name: "GPU Core 1", category: .gpu),
-            SensorDefinition(key: "Tg0b", name: "GPU Core 2", category: .gpu),
-            SensorDefinition(key: "Tg0c", name: "GPU Core 3", category: .gpu),
-            SensorDefinition(key: "Tg0d", name: "GPU Core 4", category: .gpu),
-            SensorDefinition(key: "Tg0e", name: "GPU Core 5", category: .gpu),
-            SensorDefinition(key: "Tg0f", name: "GPU Core 6", category: .gpu),
-            SensorDefinition(key: "Tg0g", name: "GPU Core 7", category: .gpu),
-            SensorDefinition(key: "Tg0h", name: "GPU Core 8", category: .gpu),
-            SensorDefinition(key: "Tg1a", name: "GPU Core 9", category: .gpu),
-            SensorDefinition(key: "Tg1b", name: "GPU Core 10", category: .gpu),
-            SensorDefinition(key: "Tg1c", name: "GPU Core 11", category: .gpu),
-            SensorDefinition(key: "Tg1d", name: "GPU Core 12", category: .gpu),
-            SensorDefinition(key: "Tg1e", name: "GPU Core 13", category: .gpu),
-            SensorDefinition(key: "Tg1f", name: "GPU Core 14", category: .gpu),
-            SensorDefinition(key: "Tg1g", name: "GPU Core 15", category: .gpu),
-            SensorDefinition(key: "Tg1h", name: "GPU Core 16", category: .gpu),
-            SensorDefinition(key: "Tg2a", name: "GPU Core 17", category: .gpu),
-            SensorDefinition(key: "Tg2b", name: "GPU Core 18", category: .gpu),
-            SensorDefinition(key: "Tg2c", name: "GPU Core 19", category: .gpu),
-            SensorDefinition(key: "Tg2d", name: "GPU Core 20", category: .gpu),
-            SensorDefinition(key: "Tg2e", name: "GPU Core 21", category: .gpu),
-            SensorDefinition(key: "Tg2f", name: "GPU Core 22", category: .gpu),
-            SensorDefinition(key: "Tg2g", name: "GPU Core 23", category: .gpu),
-            SensorDefinition(key: "Tg2h", name: "GPU Core 24", category: .gpu),
-            SensorDefinition(key: "TRDX", name: "GPU Die Hotspot", category: .gpu),
-            SensorDefinition(key: "TPMP", name: "SoC Package", category: .power),
-            SensorDefinition(key: "TPDX", name: "SoC Package Hotspot", category: .power),
-            SensorDefinition(key: "Tp0P", name: "Power Manager Die", category: .power),
-            SensorDefinition(key: "TW0P", name: "Wi-Fi Proximity", category: .other),
-            SensorDefinition(key: "TVD0", name: "Voltage Regulator", category: .power),
-            SensorDefinition(key: "Tm0P", name: "Memory Proximity", category: .power),
-            SensorDefinition(key: "Tm0p", name: "Memory Proximity", category: .power),
-            SensorDefinition(key: "TB0T", name: "Battery", category: .battery),
-            SensorDefinition(key: "TH0P", name: "Heat Pipe", category: .other),
-            SensorDefinition(key: "Ts0P", name: "Palm Rest", category: .other),
-            SensorDefinition(key: "TN0D", name: "Platform Controller", category: .other),
-            SensorDefinition(key: "TS0P", name: "SSD Proximity", category: .storage)
-        ]
+        var common = readSensors(SMCSensorCatalog.common, using: smc)
+        let gpu = readSensors(SMCSensorCatalog.gpuCoreCandidates, using: smc)
+        let modern = readSensors(SMCSensorCatalog.modernPerformanceCandidates, using: smc)
+        let legacy = readSensors(SMCSensorCatalog.legacyCoreCandidates, using: smc)
+        let cores = SMCSensorCatalog.selectingCoreFamily(modern: modern, legacy: legacy)
 
-        let modernPerformanceKeys = ["Tp0G", "Tp0H", "Tp0I", "Tp0K", "Tp0L", "Tp0M", "Tp0O", "Tp0P", "Tp0Q", "Tp0S"]
-        let performanceCoreCount = min(
-            modernPerformanceKeys.count,
-            max(0, Self.sysctlInt("hw.perflevel0.physicalcpu") ?? 0)
-        )
-        if chipName.localizedCaseInsensitiveContains("Apple M") && performanceCoreCount > 0 {
-            definitions.removeAll { $0.key == "Tp0P" }
-            definitions.append(contentsOf: modernPerformanceKeys.prefix(performanceCoreCount).enumerated().map { offset, key in
-                SensorDefinition(key: key, name: "CPU Performance Core \(offset + 1)", category: .cpu)
-            })
-        } else {
-            definitions.append(contentsOf: [
-                SensorDefinition(key: "Tp09", name: "CPU Efficiency Core 1", category: .cpu),
-                SensorDefinition(key: "Tp0T", name: "CPU Efficiency Core 2", category: .cpu),
-                SensorDefinition(key: "Tp01", name: "CPU Performance Core 1", category: .cpu),
-                SensorDefinition(key: "Tp05", name: "CPU Performance Core 2", category: .cpu),
-                SensorDefinition(key: "Tp0D", name: "CPU Performance Core 3", category: .cpu)
-            ])
+        // Tp0P changes meaning between firmware generations. If it is part of
+        // the coherent modern CPU-core family, do not also label it as power.
+        if cores.contains(where: { $0.id == "Tp0P" })
+            || SMCSensorCatalog.isUniformFortyCoreFamily(modern) {
+            common.removeAll { $0.id == "Tp0P" }
         }
 
         var readings: [ThermalSensor] = []
         var seenKeys = Set<String>()
+        for sensor in common + gpu + cores where seenKeys.insert(sensor.id).inserted {
+            readings.append(sensor)
+        }
+        return SensorContinuity.removingFlatCoreSentinels(from: readings)
+    }
 
-        for definition in definitions where !seenKeys.contains(definition.key) {
-            seenKeys.insert(definition.key)
+    private func readSensors(
+        _ definitions: [SMCSensorDefinition],
+        using smc: any SMCReadingProviding
+    ) -> [ThermalSensor] {
+        let updatedAt = Date()
+        return definitions.compactMap { definition in
             guard
                 let reading = try? smc.readNumber(key: definition.key),
-                reading.value.isFinite,
-                Self.isPlausibleTemperature(reading.value),
-                reading.value < 130
+                Self.isPlausibleTemperature(reading.value)
             else {
-                continue
+                return nil
             }
-
-            readings.append(ThermalSensor(
+            return ThermalSensor(
                 id: definition.key,
                 name: definition.name,
                 category: definition.category,
@@ -633,19 +689,19 @@ final class HardwareProbe: @unchecked Sendable {
                 source: .smc,
                 isFavorite: false,
                 isHidden: false,
-                updatedAt: Date()
-            ))
+                updatedAt: updatedAt
+            )
         }
-
-        return SensorContinuity.removingFlatCoreSentinels(from: readings)
     }
 
-    private func readSMCFans() -> [FanDevice] {
-        guard let smc else { return [] }
-        let count = Int((try? smc.readNumber(key: "FNum").value) ?? 0)
-        guard count > 0, count < 8 else { return [] }
+    private func readSMCFans() -> (fans: [FanDevice], warning: String?) {
+        guard let smc else { return ([], "Apple SMC is unavailable; fan topology could not be verified.") }
+        guard let count = SMCNumericPolicy.fanCount(try? smc.readNumber(key: "FNum").value) else {
+            return ([], "The SMC fan count is missing or invalid; this session is monitoring-only.")
+        }
+        guard count > 0 else { return ([], nil) }
 
-        return (0..<count).compactMap { index in
+        let fans: [FanDevice] = (0..<count).compactMap { index in
             let prefix = "F\(index)"
             guard
                 let minReading = try? smc.readNumber(key: "\(prefix)Mn"),
@@ -654,15 +710,39 @@ final class HardwareProbe: @unchecked Sendable {
                 return nil
             }
 
-            let current = Int((try? smc.readNumber(key: "\(prefix)Ac").value) ?? 0)
-            let minRPM = Int(minReading.value)
-            let maxRPM = Int(maxReading.value)
+            let currentValue = SMCNumericPolicy.rpm(try? smc.readNumber(key: "\(prefix)Ac").value)
+            let current = currentValue ?? 0
+            guard
+                let minRPM = SMCNumericPolicy.rpm(minReading.value),
+                let maxRPM = SMCNumericPolicy.rpm(maxReading.value)
+            else {
+                return nil
+            }
             guard minRPM >= 0, maxRPM > minRPM, maxRPM >= 1000 else {
                 return nil
             }
 
-            let target = Int((try? smc.readNumber(key: "\(prefix)Tg").value) ?? Double(max(current, minRPM)))
-            let modeValue = Int((try? smc.readNumber(key: "\(prefix)Md").value) ?? 0)
+            let read: (String) -> Double? = { key in
+                try? smc.readNumber(key: key).value
+            }
+            let targetValue = SMCNumericPolicy.rpm(read("\(prefix)Tg"))
+            let target = targetValue ?? max(current, minRPM)
+            guard
+                current <= maxRPM + SMCNumericPolicy.rpmRangeTolerance,
+                target <= maxRPM + SMCNumericPolicy.rpmRangeTolerance
+            else {
+                return nil
+            }
+            var controlInterface = FanControlInterfacePolicy.detect(fanIndex: index, read: read)
+            var hardwareMode = FanControlInterfacePolicy.hardwareMode(
+                fanIndex: index,
+                interface: controlInterface,
+                read: read
+            )
+            if currentValue == nil || targetValue == nil || hardwareMode == nil {
+                controlInterface = .unavailable
+                hardwareMode = nil
+            }
 
             return FanDevice(
                 id: "fan\(index)",
@@ -671,15 +751,20 @@ final class HardwareProbe: @unchecked Sendable {
                 minRPM: minRPM,
                 maxRPM: maxRPM,
                 targetRPM: max(minRPM, min(target, maxRPM)),
-                mode: modeValue == 0 ? .automatic : .fixed,
+                mode: hardwareMode ?? .automatic,
                 linkedSensorID: nil,
                 curve: Self.defaultCurve(minRPM: minRPM, maxRPM: maxRPM),
                 source: .smc,
+                controlInterface: controlInterface,
                 lastCommand: nil,
-                hardwareMode: modeValue == 0 ? .automatic : .fixed,
+                hardwareMode: hardwareMode,
                 hardwareTargetRPM: max(minRPM, min(target, maxRPM))
             )
         }
+        let warning = fans.count == count
+            ? nil
+            : "The SMC reports \(count) fan\(count == 1 ? "" : "s"), but only \(fans.count) had a safe readable RPM range. Unreadable fans were not exposed for control."
+        return (fans, warning)
     }
 
     private func shouldSupplementWithSystemSensors(smcSensors: [ThermalSensor], systemSensors: [ThermalSensor]) -> Bool {

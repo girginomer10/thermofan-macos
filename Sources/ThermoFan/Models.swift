@@ -180,6 +180,9 @@ struct FanDevice: Identifiable, Hashable {
     var linkedSensorID: String?
     var curve: [FanCurvePoint]
     var source: ReadingSource
+    /// Runtime-discovered firmware write surface. This deliberately is not
+    /// persisted: it must be re-probed after every launch and wake.
+    var controlInterface: FanControlInterface = .unavailable
     var lastCommand: String?
     var hardwareMode: FanMode? = nil
     var hardwareTargetRPM: Int? = nil

@@ -593,7 +593,8 @@ struct FansSettingsPane: View {
     @EnvironmentObject private var store: ThermalStore
 
     var body: some View {
-        SettingsPage(title: "Fans", subtitle: "\(store.fans.count) controllable profiles") {
+        let controllableCount = store.fans.filter { $0.controlInterface.isAvailable }.count
+        return SettingsPage(title: "Fans", subtitle: "\(controllableCount) controllable · \(store.fans.count) detected") {
             if store.fans.isEmpty {
                 EmptyStateView(symbol: "fan.slash", title: "No controllable fan detected")
             } else {
@@ -910,6 +911,7 @@ struct CompactFanCard: View {
     var fan: FanDevice
 
     private var isEstimated: Bool { fan.source == .estimated }
+    private var isControllable: Bool { !isEstimated && fan.controlInterface.isAvailable }
     private var isApplying: Bool { store.applyingFanIDs.contains(fan.id) }
 
     var body: some View {
@@ -924,8 +926,8 @@ struct CompactFanCard: View {
                     .fontWeight(.semibold)
             }
 
-            if isEstimated {
-                Label("Fan control unavailable — no controllable fan detected on this Mac.", systemImage: "exclamationmark.triangle")
+            if !isControllable {
+                Label(monitoringOnlyMessage, systemImage: "exclamationmark.triangle")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1015,6 +1017,12 @@ struct CompactFanCard: View {
         }
     }
 
+    private var monitoringOnlyMessage: String {
+        isEstimated
+            ? "Fan control unavailable — no controllable fan detected on this Mac."
+            : "Monitoring only — this firmware exposes no verified fan-control interface."
+    }
+
     private var commandSymbol: String {
         switch fan.controlState {
         case .failed: "xmark.octagon.fill"
@@ -1040,6 +1048,7 @@ struct FullFanCard: View {
     var fan: FanDevice
 
     private var isEstimated: Bool { fan.source == .estimated }
+    private var isControllable: Bool { !isEstimated && fan.controlInterface.isAvailable }
     private var isApplying: Bool { store.applyingFanIDs.contains(fan.id) }
 
     var body: some View {
@@ -1065,8 +1074,8 @@ struct FullFanCard: View {
                 }
             }
 
-            if isEstimated {
-                Label("Fan control is unavailable — no controllable fan was detected on this Mac (SMC fan keys are not readable). Values above are estimated.", systemImage: "exclamationmark.triangle")
+            if !isControllable {
+                Label(monitoringOnlyMessage, systemImage: "exclamationmark.triangle")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1187,6 +1196,12 @@ struct FullFanCard: View {
         case .curve:
             return "Curve target \(fan.targetRPM)"
         }
+    }
+
+    private var monitoringOnlyMessage: String {
+        isEstimated
+            ? "Fan control is unavailable — no controllable fan was detected on this Mac. Values above are estimated."
+            : "Monitoring only — RPM telemetry is readable, but this firmware exposes no verified fan-control interface. No hardware writes will be attempted."
     }
 
     private var applyButtonTitle: String {

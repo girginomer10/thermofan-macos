@@ -82,3 +82,26 @@
   GPU-core groups should be treated as firmware sentinels without suppressing
   unrelated GPU cluster or hotspot readings.
 - Next: None.
+
+## 2026-08-27 22:33 +03 - Codex
+
+- Task: Replace the Mac App Store plan with guarded direct distribution and
+  harden runtime compatibility for M1-M5 firmware variations.
+- Changed: Added capability-based `F{i}Md`/`F{i}md` and fanless/read-only
+  handling; helper v8 ownership, pre-write watchdog, rollback, and `Ftst`
+  safeguards; wake serialization; M-series fixtures; arm64 Developer ID,
+  notarization, and isolated-DMG tooling and documentation.
+- Verified: `swift test` (50 passed), strict C11 warning/syntax and release-link
+  checks, arm64 release build, strict app/helper signatures, Hardened Runtime,
+  macOS 14 deployment targets, helper v8, guarded-release exit 78, disabled
+  one-shot fixed control, and a mounted test DMG with no nested candidate.
+  Read-only M4 Pro diagnostics found 22 real sensors and one `F0Md` fan in Auto
+  at a 1,000-4,900 RPM range. No fan write was performed in this session.
+- Memory: Determine compatibility from live capabilities, never use `FS!` as a
+  generic Apple Silicon fallback, and report physical model verification
+  separately from fixture coverage. Recovery-required status needs matching
+  durable owner and fan state; ownership uses PID plus process start time to
+  reject PID reuse.
+- Next: Replace the legacy setuid installer with authenticated
+  `SMAppService`/XPC, install a Developer ID certificate and notarize, then run
+  the v8 write/sleep/force-quit acceptance matrix on physical M1-M5 models.

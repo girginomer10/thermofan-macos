@@ -42,7 +42,7 @@ enum CommandLineEntrypoint {
 
         print("Real fans: \(realFans.count)")
         for fan in realFans {
-            print("  \(fan.id)  \(fan.name): current \(fan.currentRPM) RPM, target \(fan.targetRPM) RPM, range \(fan.minRPM)-\(fan.maxRPM)")
+            print("  \(fan.id)  \(fan.name): current \(fan.currentRPM) RPM, target \(fan.targetRPM) RPM, range \(fan.minRPM)-\(fan.maxRPM), \(fan.controlInterface.diagnosticLabel)")
         }
         if realFans.isEmpty {
             print("  none")
@@ -61,10 +61,10 @@ enum CommandLineEntrypoint {
 
     private static func runRawReads() {
         let keys = [
-            "#KEY", "FNum", "FS! ", "F0Ac", "F0Mn", "F0Mx", "F0Tg", "F0Md", "F0St", "F0Dc", "F0CR",
+            "#KEY", "FNum", "FS! ", "Ftst", "F0Ac", "F0Mn", "F0Mx", "F0Tg", "F0Md", "F0md", "F0St", "F0Dc", "F0CR",
             "F0TE", "F0S0", "F0S1", "F0S2", "F0S3", "F0S4", "F0S5", "F0S6", "F0S7",
             "spf0", "RPF0", "SFF0", "SEF0", "SEf0", "maF0", "mxF0", "rtF0", "of00", "oF00", "isF0",
-            "F1Ac", "F1Mn", "F1Mx", "F1Tg",
+            "F1Ac", "F1Mn", "F1Mx", "F1Tg", "F1Md", "F1md",
             "TA0P", "TC0P", "TC0E", "TC0D", "TC1C", "TC2C", "Tp09", "Tp01",
             "TG0P", "TG0D", "Tg05", "Tp0P", "TW0P", "TB0T", "TS0P"
         ]
@@ -148,7 +148,7 @@ enum CommandLineEntrypoint {
 
     private static func runFanControl(arguments: [String]) -> Int32 {
         guard arguments.count >= 2 else {
-            writeError("Usage: ThermoFan --fanctl <fan-index> <automatic|fixed|curve> [rpm]")
+            writeError("Usage: ThermoFan --fanctl <fan-index> automatic")
             return 64
         }
 
@@ -161,25 +161,27 @@ enum CommandLineEntrypoint {
             writeError("Invalid fan mode '\(arguments[1])'.")
             return 64
         }
-
-        let rpm: Int?
-        if mode == .automatic {
-            rpm = nil
-        } else {
-            guard arguments.count >= 3, let parsedRPM = Int(arguments[2]) else {
-                writeError("RPM is required for \(mode.rawValue) mode.")
-                return 64
-            }
-            rpm = parsedRPM
+        guard mode == .automatic else {
+            writeError(
+                "Fixed and curve one-shot commands are disabled because they cannot guarantee a verified crash watchdog. Use the ThermoFan app instead."
+            )
+            return 64
+        }
+        guard arguments.count == 2 else {
+            writeError("Automatic mode does not accept an RPM or extra arguments.")
+            return 64
         }
 
-        do {
-            let message = try FanControlService().applyDirect(fanIndex: fanIndex, mode: mode, rpm: rpm)
+        switch FanControlService().applyCommandWithPersistentHelper(fanIndex: fanIndex, mode: mode, rpm: nil) {
+        case .applied(let message):
             print(message)
             return 0
-        } catch {
-            writeError(describe(error))
+        case .failed(let message):
+            writeError(message)
             return 1
+        case .recoveryRequired(let message):
+            writeError(message)
+            return 75
         }
     }
 

@@ -38,17 +38,21 @@ final class ThermalStore: ObservableObject {
     private var sensorPreferences: [String: SensorPreference] = [:]
     private var timer: Timer?
     private var isSampling = false
+    private var sampleGeneration: UInt64 = 0
     private var pendingSave: DispatchWorkItem?
     private var wakeCancellable: AnyCancellable?
-    private var needsWakeReapply = false
+    private var pendingWakeReapplyAttempts: [String: Int] = [:]
     private var activeHardwareFanIDs: Set<String> = []
-    private var watchdogFanIDs: Set<String> = []
+    private var automaticRecoveryFanIDs: Set<String> = []
+    private var automaticRecoveryAttempts: [String: Int] = [:]
     private var lastAppliedConfigurations: [String: FanDevice] = [:]
     private var appWarnings: [String] = []
     /// Last RPM actually written to hardware per fan, used to throttle the curve
     /// control loop so it only re-applies when the target moves meaningfully.
     private var lastAppliedRPM: [String: Int] = [:]
     private static let curveHysteresisRPM = 100
+    private static let maximumWakeReapplyAttempts = 3
+    private static let maximumAutomaticRecoveryAttempts = 3
     /// Ring buffer of recent temperature readings per sensor (max 3). Used to
     /// compute a median for the menu bar display, preventing transient SMC
     /// spikes from flashing a misleading value in the status bar.
@@ -193,15 +197,20 @@ final class ThermalStore: ObservableObject {
         isRefreshing = true
         let prefs = preferences
         let probe = self.probe
+        let generation = sampleGeneration
         sampleQueue.async {
             let snapshot = probe.sample(preferences: prefs)
             Task { @MainActor [weak self] in
-                self?.applySnapshot(snapshot)
+                self?.applySnapshot(snapshot, generation: generation)
             }
         }
     }
 
-    private func applySnapshot(_ snapshot: HardwareSnapshot) {
+    private func applySnapshot(_ snapshot: HardwareSnapshot, generation: UInt64) {
+        // A sample that began before wake may contain stale SMC metadata. The
+        // wake sample is serialized behind it and is the only generation that
+        // may update the UI or trigger hardware recovery.
+        guard generation == sampleGeneration else { return }
         let previousSettings = currentFanSettings()
         machine = snapshot.machine
         warnings = snapshot.warnings + appWarnings
@@ -216,12 +225,16 @@ final class ThermalStore: ObservableObject {
         // no fans (transient SMC read failure) so hand-tuned curves aren't wiped.
         if !snapshot.fans.isEmpty {
             fans = mergeFans(snapshot.fans)
-        } else if !fans.contains(where: { $0.source != .estimated }) {
+        } else if fans.contains(where: { $0.source != .estimated }) {
+            // Preserve configuration through a transient SMC miss, but mark the
+            // missing hardware read-only until it is rediscovered.
+            fans = mergeFans([])
+        } else {
             fans = []
         }
         applyCurveTargets()
-        if needsWakeReapply {
-            needsWakeReapply = false
+        recoverFansRequiringAutomaticControl()
+        if !pendingWakeReapplyAttempts.isEmpty {
             reapplyActiveFansAfterWake()
         }
         autoApplyCurveTargets()
@@ -501,10 +514,15 @@ final class ThermalStore: ObservableObject {
             fans[index].lastCommand = "Fan control is unavailable — no controllable fan was detected on this Mac."
             return
         }
+        guard fans[index].controlInterface.isAvailable else {
+            fans[index].controlState = .failed
+            fans[index].lastCommand = "Monitoring only: this firmware exposes no verified fan-control interface, so no hardware write was attempted."
+            return
+        }
 
         let fan = fans[index]
         let control = fanControl
-        let shouldStartWatchdog = fan.mode != .automatic && !watchdogFanIDs.contains(fanID)
+        let requiresWatchdog = fan.mode != .automatic
         let parentPID = ProcessInfo.processInfo.processIdentifier
         applyingFanIDs.insert(fanID)
 
@@ -513,39 +531,55 @@ final class ThermalStore: ObservableObject {
                 switch control.installPersistentHelper() {
                 case .applied:
                     break
-                case .failed(let text):
+                case .failed(let text), .recoveryRequired(let text):
                     Task { @MainActor [weak self] in
                         self?.finishApply(
                             appliedFan: fan,
                             message: text,
                             succeeded: false,
                             helperState: control.persistentHelperState,
-                            watchdogStarted: false
+                            recoveryRequired: false
                         )
                     }
                     return
                 }
             }
 
-            var message: String
+            if requiresWatchdog {
+                do {
+                    // Manual control is impossible until the privileged watcher
+                    // confirms that it is already observing this app's exit.
+                    try control.startWatchdog(for: fan, parentPID: parentPID)
+                } catch {
+                    Task { @MainActor [weak self] in
+                        self?.finishApply(
+                            appliedFan: fan,
+                            message: "No hardware write was attempted because the crash watchdog could not be verified: \(error.localizedDescription)",
+                            succeeded: false,
+                            helperState: control.persistentHelperState,
+                            recoveryRequired: false
+                        )
+                    }
+                    return
+                }
+            }
+
+            let message: String
             let succeeded: Bool
+            let recoveryRequired: Bool
             switch control.applyWithPersistentHelper(fan) {
             case .applied(let text):
                 message = text
                 succeeded = true
+                recoveryRequired = false
             case .failed(let text):
                 message = text
                 succeeded = false
-            }
-
-            var watchdogStarted = false
-            if succeeded, shouldStartWatchdog {
-                do {
-                    try control.startWatchdog(for: fan, parentPID: parentPID)
-                    watchdogStarted = true
-                } catch {
-                    message += " Crash watchdog could not start: \(error.localizedDescription)"
-                }
+                recoveryRequired = false
+            case .recoveryRequired(let text):
+                message = text
+                succeeded = false
+                recoveryRequired = true
             }
 
             Task { @MainActor [weak self] in
@@ -554,7 +588,7 @@ final class ThermalStore: ObservableObject {
                     message: message,
                     succeeded: succeeded,
                     helperState: control.persistentHelperState,
-                    watchdogStarted: watchdogStarted
+                    recoveryRequired: recoveryRequired
                 )
             }
         }
@@ -565,17 +599,17 @@ final class ThermalStore: ObservableObject {
         message: String,
         succeeded: Bool,
         helperState: HardwareHelperState,
-        watchdogStarted: Bool
+        recoveryRequired: Bool
     ) {
         let fanID = appliedFan.id
         self.helperState = helperState
-        if watchdogStarted {
-            watchdogFanIDs.insert(fanID)
-        }
 
         if succeeded {
+            automaticRecoveryFanIDs.remove(fanID)
+            automaticRecoveryAttempts[fanID] = nil
             if appliedFan.mode == .automatic {
                 activeHardwareFanIDs.remove(fanID)
+                pendingWakeReapplyAttempts[fanID] = nil
                 lastAppliedRPM[fanID] = nil
                 lastAppliedConfigurations[fanID] = nil
             } else {
@@ -584,6 +618,12 @@ final class ThermalStore: ObservableObject {
             }
         } else {
             lastAppliedRPM[fanID] = nil
+            if recoveryRequired {
+                activeHardwareFanIDs.insert(fanID)
+                lastAppliedConfigurations[fanID] = appliedFan
+                automaticRecoveryFanIDs.insert(fanID)
+                automaticRecoveryAttempts[fanID] = 0
+            }
         }
 
         if let index = fans.firstIndex(where: { $0.id == fanID }) {
@@ -603,6 +643,12 @@ final class ThermalStore: ObservableObject {
         }
         applyingFanIDs.remove(fanID)
         save()
+        if recoveryRequired {
+            scheduleAutomaticRecovery(
+                fanID: fanID,
+                reason: "The helper could not verify rollback after a failed hardware write."
+            )
+        }
         refresh()
     }
 
@@ -617,7 +663,7 @@ final class ThermalStore: ObservableObject {
             let helperState = control.persistentHelperState
             let message: String
             switch result {
-            case .applied(let text), .failed(let text):
+            case .applied(let text), .failed(let text), .recoveryRequired(let text):
                 message = text
             }
             Task { @MainActor [weak self] in
@@ -639,7 +685,7 @@ final class ThermalStore: ObservableObject {
     private func autoApplyCurveTargets() {
         guard helperInstalled else { return }
         let control = fanControl
-        for fan in fans where fan.mode == .curve && fan.source != .estimated {
+        for fan in fans where fan.mode == .curve && fan.source != .estimated && fan.controlInterface.isAvailable {
             guard activeHardwareFanIDs.contains(fan.id) else { continue }
             guard !applyingFanIDs.contains(fan.id) else { continue }
             guard let previous = lastAppliedRPM[fan.id] else { continue }
@@ -672,8 +718,22 @@ final class ThermalStore: ObservableObject {
             lastAppliedRPM[appliedFan.id] = nil
             fans[index].controlState = .failed
             fans[index].lastCommand = message
+        case .recoveryRequired(let message):
+            lastAppliedRPM[appliedFan.id] = nil
+            activeHardwareFanIDs.insert(appliedFan.id)
+            lastAppliedConfigurations[appliedFan.id] = appliedFan
+            automaticRecoveryFanIDs.insert(appliedFan.id)
+            automaticRecoveryAttempts[appliedFan.id] = 0
+            fans[index].controlState = .failed
+            fans[index].lastCommand = message
         }
         applyingFanIDs.remove(appliedFan.id)
+        if case .recoveryRequired = result {
+            scheduleAutomaticRecovery(
+                fanID: appliedFan.id,
+                reason: "Curve control failed and automatic rollback could not be verified."
+            )
+        }
     }
 
     /// Returns forced fans to automatic control before the app exits so a fan is
@@ -976,7 +1036,7 @@ final class ThermalStore: ObservableObject {
 
     private func mergeFans(_ incoming: [FanDevice]) -> [FanDevice] {
         let existing = Dictionary(uniqueKeysWithValues: fans.map { ($0.id, $0) })
-        return incoming.map { fan in
+        var mergedFans = incoming.map { fan in
             guard let saved = existing[fan.id] else {
                 var discovered = fan
                 discovered.curve = FanCurveMath.normalized(
@@ -1002,6 +1062,11 @@ final class ThermalStore: ObservableObject {
             merged.lastCommand = saved.lastCommand
             merged.controlState = saved.controlState
 
+            if !fan.controlInterface.isAvailable && activeHardwareFanIDs.contains(fan.id) {
+                merged.controlState = .failed
+                merged.lastCommand = "The verified control interface disappeared. ThermoFan is returning this fan to automatic control; manual writes are disabled."
+            }
+
             if saved.source == .estimated {
                 if saved.mode == .automatic, fan.hardwareMode == .automatic {
                     merged.controlState = .idle
@@ -1017,6 +1082,17 @@ final class ThermalStore: ObservableObject {
             }
             return merged
         }
+
+        let incomingIDs = Set(incoming.map(\.id))
+        for missing in fans where missing.source != .estimated && !incomingIDs.contains(missing.id) {
+            var stale = missing
+            stale.controlInterface = .unavailable
+            stale.hardwareMode = nil
+            stale.controlState = .failed
+            stale.lastCommand = "Fan telemetry is temporarily unavailable. Last reading is shown; hardware writes are disabled."
+            mergedFans.append(stale)
+        }
+        return mergedFans.sorted { $0.id < $1.id }
     }
 
     private func applyCurveTargets() {
@@ -1095,42 +1171,300 @@ final class ThermalStore: ObservableObject {
     }
 
     private func handleWake() {
-        needsWakeReapply = !activeHardwareFanIDs.isEmpty
+        sampleGeneration &+= 1
+        pendingWakeReapplyAttempts = Dictionary(
+            uniqueKeysWithValues: activeHardwareFanIDs.map { ($0, 0) }
+        )
         restartTimer()
-        refresh()
+        isSampling = true
+        isRefreshing = true
+        let prefs = preferences
+        let probe = self.probe
+        let generation = sampleGeneration
+        sampleQueue.async {
+            // This runs after any pre-wake sample already on the serial queue,
+            // so cache invalidation cannot race a dictionary read or SMC call.
+            probe.prepareAfterWake()
+            let snapshot = probe.sample(preferences: prefs)
+            Task { @MainActor [weak self] in
+                self?.applySnapshot(snapshot, generation: generation)
+            }
+        }
     }
 
     private func reapplyActiveFansAfterWake() {
-        guard helperInstalled else { return }
+        guard helperInstalled else {
+            addWarning("Fan settings are waiting after wake because the verified Hardware Helper is unavailable.")
+            return
+        }
         let control = fanControl
-        for fanID in activeHardwareFanIDs where !applyingFanIDs.contains(fanID) {
-            let current = fans.first(where: { $0.id == fanID })
-            let applied = current?.controlState == .active ? current : lastAppliedConfigurations[fanID]
+        for fanID in pendingWakeReapplyAttempts.keys.sorted() where !applyingFanIDs.contains(fanID) {
+            guard activeHardwareFanIDs.contains(fanID) else {
+                pendingWakeReapplyAttempts[fanID] = nil
+                continue
+            }
+            let attempts = pendingWakeReapplyAttempts[fanID] ?? 0
+            if attempts >= Self.maximumWakeReapplyAttempts {
+                scheduleAutomaticRecovery(
+                    fanID: fanID,
+                    reason: "Wake restore reached its retry limit."
+                )
+                continue
+            }
+            guard let current = fans.first(where: { $0.id == fanID }) else { continue }
+            guard current.controlInterface.isAvailable else {
+                pendingWakeReapplyAttempts[fanID] = attempts + 1
+                if let index = fans.firstIndex(where: { $0.id == fanID }) {
+                    fans[index].controlState = .failed
+                    fans[index].lastCommand = "Wake restore is waiting for the fan-control interface to be re-verified."
+                }
+                continue
+            }
+            var applied = current.controlState == .active ? current : lastAppliedConfigurations[fanID]
+            applied?.controlInterface = current.controlInterface
             guard let applied else { continue }
+            let nextAttempt = attempts + 1
+            let maximumAttempts = Self.maximumWakeReapplyAttempts
             applyingFanIDs.insert(fanID)
             controlQueue.async {
                 let result = control.applyWithPersistentHelper(applied)
-                let message: String
-                let succeeded: Bool
+                var recoveryResult: FanControlService.ApplyResult?
+                let shouldRecoverAutomatically: Bool
                 switch result {
+                case .recoveryRequired:
+                    shouldRecoverAutomatically = true
+                case .failed:
+                    shouldRecoverAutomatically = nextAttempt >= maximumAttempts
                 case .applied:
-                    message = "Fan settings restored after wake."
-                    succeeded = true
-                case .failed(let text):
-                    message = "Wake restore failed: \(text)"
-                    succeeded = false
+                    shouldRecoverAutomatically = false
+                }
+                if shouldRecoverAutomatically {
+                    var reset = applied
+                    reset.mode = .automatic
+                    recoveryResult = control.applyWithPersistentHelper(reset)
                 }
                 Task { @MainActor [weak self] in
-                    self?.finishApply(
+                    self?.finishWakeReapply(
                         appliedFan: applied,
-                        message: message,
-                        succeeded: succeeded,
-                        helperState: control.persistentHelperState,
-                        watchdogStarted: false
+                        result: result,
+                        attempt: nextAttempt,
+                        recoveryResult: recoveryResult,
+                        helperState: control.persistentHelperState
                     )
                 }
             }
         }
+    }
+
+    private func finishWakeReapply(
+        appliedFan: FanDevice,
+        result: FanControlService.ApplyResult,
+        attempt: Int,
+        recoveryResult: FanControlService.ApplyResult?,
+        helperState: HardwareHelperState
+    ) {
+        let fanID = appliedFan.id
+        self.helperState = helperState
+        applyingFanIDs.remove(fanID)
+
+        switch result {
+        case .applied:
+            pendingWakeReapplyAttempts[fanID] = nil
+            automaticRecoveryFanIDs.remove(fanID)
+            automaticRecoveryAttempts[fanID] = nil
+            activeHardwareFanIDs.insert(fanID)
+            lastAppliedConfigurations[fanID] = appliedFan
+            lastAppliedRPM[fanID] = appliedFan.targetRPM
+            if let index = fans.firstIndex(where: { $0.id == fanID }) {
+                if sameConfiguration(fans[index], appliedFan) {
+                    fans[index].controlState = .active
+                    fans[index].lastCommand = "Fan settings restored after wake."
+                } else {
+                    fans[index].controlState = .pending
+                    fans[index].lastCommand = "Fan settings restored after wake. Newer edits are still pending."
+                }
+            }
+
+        case .failed(let message):
+            finishWakeReapplyFailure(
+                appliedFan: appliedFan,
+                message: message,
+                attempt: attempt,
+                recoveryResult: recoveryResult,
+                recoveryWasRequired: false
+            )
+        case .recoveryRequired(let message):
+            finishWakeReapplyFailure(
+                appliedFan: appliedFan,
+                message: message,
+                attempt: attempt,
+                recoveryResult: recoveryResult,
+                recoveryWasRequired: true
+            )
+        }
+        save()
+    }
+
+    private func finishWakeReapplyFailure(
+        appliedFan: FanDevice,
+        message: String,
+        attempt: Int,
+        recoveryResult: FanControlService.ApplyResult?,
+        recoveryWasRequired: Bool
+    ) {
+        let fanID = appliedFan.id
+        lastAppliedRPM[fanID] = nil
+
+        if let recoveryResult {
+            switch recoveryResult {
+            case .applied:
+                pendingWakeReapplyAttempts[fanID] = nil
+                automaticRecoveryFanIDs.remove(fanID)
+                automaticRecoveryAttempts[fanID] = nil
+                activeHardwareFanIDs.remove(fanID)
+                lastAppliedConfigurations[fanID] = nil
+                if let index = fans.firstIndex(where: { $0.id == fanID }) {
+                    fans[index].controlState = .pending
+                    fans[index].lastCommand = "Wake restore failed after \(attempt) attempt(s), so the fan was verified back in automatic control. Review and apply again if needed."
+                }
+            case .failed(let recoveryMessage), .recoveryRequired(let recoveryMessage):
+                pendingWakeReapplyAttempts[fanID] = nil
+                automaticRecoveryFanIDs.insert(fanID)
+                automaticRecoveryAttempts[fanID] = 0
+                if let index = fans.firstIndex(where: { $0.id == fanID }) {
+                    fans[index].controlState = .failed
+                    fans[index].lastCommand = "Wake restore failed: \(message) Automatic recovery also failed: \(recoveryMessage) The watchdog remains active while bounded recovery retries continue."
+                }
+                addWarning("Automatic fan recovery after wake failed and will be retried.")
+                scheduleAutomaticRecovery(
+                    fanID: fanID,
+                    reason: "Wake restore and its immediate automatic rollback both failed."
+                )
+            }
+            return
+        }
+
+        if recoveryWasRequired {
+            pendingWakeReapplyAttempts[fanID] = nil
+            automaticRecoveryFanIDs.insert(fanID)
+            automaticRecoveryAttempts[fanID] = 0
+            if let index = fans.firstIndex(where: { $0.id == fanID }) {
+                fans[index].controlState = .failed
+                fans[index].lastCommand = "Wake restore could not verify automatic rollback: \(message)"
+            }
+            scheduleAutomaticRecovery(
+                fanID: fanID,
+                reason: "Wake restore could not verify automatic rollback."
+            )
+        } else {
+            pendingWakeReapplyAttempts[fanID] = attempt
+            if let index = fans.firstIndex(where: { $0.id == fanID }) {
+                fans[index].controlState = .failed
+                fans[index].lastCommand = "Wake restore attempt \(attempt) failed: \(message)"
+            }
+        }
+    }
+
+    /// A fan that was actively controlled must never keep a stale manual target
+    /// after its write interface disappears. The helper independently re-probes
+    /// the firmware and verifies Auto/System mode; failures remain retryable.
+    private func recoverFansRequiringAutomaticControl() {
+        for fanID in activeHardwareFanIDs.sorted() {
+            guard
+                let fan = fans.first(where: { $0.id == fanID }),
+                !fan.controlInterface.isAvailable
+            else {
+                continue
+            }
+            automaticRecoveryFanIDs.insert(fanID)
+            if automaticRecoveryAttempts[fanID] == nil {
+                automaticRecoveryAttempts[fanID] = 0
+            }
+        }
+
+        for fanID in automaticRecoveryFanIDs.sorted() {
+            scheduleAutomaticRecovery(
+                fanID: fanID,
+                reason: "Automatic control is required because the previous hardware state could not be verified."
+            )
+        }
+    }
+
+    private func scheduleAutomaticRecovery(fanID: String, reason: String) {
+        guard !applyingFanIDs.contains(fanID) else { return }
+        guard helperInstalled else {
+            addWarning("\(reason) Automatic recovery is waiting for the verified Hardware Helper.")
+            return
+        }
+        guard var reset = lastAppliedConfigurations[fanID]
+            ?? fans.first(where: { $0.id == fanID })
+        else {
+            addWarning("\(reason) The last fan configuration is unavailable for automatic recovery.")
+            return
+        }
+
+        automaticRecoveryFanIDs.insert(fanID)
+        pendingWakeReapplyAttempts[fanID] = nil
+        let attempts = automaticRecoveryAttempts[fanID] ?? 0
+        guard attempts < Self.maximumAutomaticRecoveryAttempts else {
+            if let index = fans.firstIndex(where: { $0.id == fanID }) {
+                fans[index].controlState = .failed
+                fans[index].lastCommand = "Automatic recovery reached its retry limit. The verified crash watchdog remains active; quit ThermoFan to trigger its final recovery path."
+            }
+            addWarning("Automatic fan recovery reached its retry limit; quit ThermoFan to trigger watchdog recovery.")
+            return
+        }
+        automaticRecoveryAttempts[fanID] = attempts + 1
+
+        reset.mode = .automatic
+        let automaticReset = reset
+        let control = fanControl
+        applyingFanIDs.insert(fanID)
+        controlQueue.async {
+            let result = control.applyWithPersistentHelper(automaticReset)
+            Task { @MainActor [weak self] in
+                self?.finishAutomaticRecovery(
+                    fanID: fanID,
+                    reason: reason,
+                    result: result,
+                    helperState: control.persistentHelperState
+                )
+            }
+        }
+    }
+
+    private func finishAutomaticRecovery(
+        fanID: String,
+        reason: String,
+        result: FanControlService.ApplyResult,
+        helperState: HardwareHelperState
+    ) {
+        self.helperState = helperState
+        applyingFanIDs.remove(fanID)
+        lastAppliedRPM[fanID] = nil
+        if case .applied = result {
+            activeHardwareFanIDs.remove(fanID)
+            pendingWakeReapplyAttempts[fanID] = nil
+            lastAppliedConfigurations[fanID] = nil
+            automaticRecoveryFanIDs.remove(fanID)
+            automaticRecoveryAttempts[fanID] = nil
+        }
+        if let index = fans.firstIndex(where: { $0.id == fanID }) {
+            switch result {
+            case .applied:
+                fans[index].controlState = .pending
+                fans[index].lastCommand = "\(reason) The fan was verified back in automatic control. Review before applying manual control again."
+            case .failed(let message):
+                fans[index].controlState = .failed
+                fans[index].lastCommand = "\(reason) Automatic recovery failed: \(message) The crash watchdog remains active; bounded recovery will retry."
+                addWarning("Automatic recovery for \(fans[index].name) failed and will be retried.")
+            case .recoveryRequired(let message):
+                fans[index].controlState = .failed
+                fans[index].lastCommand = "\(reason) Automatic recovery could not be verified: \(message) The crash watchdog remains active; bounded recovery will retry."
+                addWarning("Automatic recovery for \(fans[index].name) could not be verified and will be retried.")
+            }
+        }
+        save()
     }
 
     private func addWarning(_ message: String) {

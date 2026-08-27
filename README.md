@@ -25,6 +25,8 @@ mode have been read back from the SMC.
 ## Highlights
 
 - Real SMC fan discovery with current, minimum, maximum, and target RPM
+- Runtime detection of uppercase and lowercase Apple Silicon fan-mode keys
+- Monitoring-only fallback when a firmware control surface is not verified
 - Real SMC and Apple PMU/HID temperature readings
 - Automatic, fixed-RPM, and temperature-curve fan modes
 - Drag-editable curve graph with labeled temperature and RPM axes
@@ -57,15 +59,15 @@ mode have been read back from the SMC.
 | Item | Status |
 | --- | --- |
 | Minimum OS | macOS 14 |
-| Architecture | Apple Silicon and Intel code paths |
-| Validated hardware | Mac16,11 with Apple M4 Pro |
+| Distribution architecture | arm64 (Apple Silicon M-series) |
+| Software capability coverage | M1-M5 fanless, one-fan, and two-fan firmware shapes |
+| Current read-only validation | Mac16,11 with Apple M4 Pro |
 | Validated OS | macOS 26.5.1 |
-| Validated fan layout | One fan, 1,000-4,900 RPM |
-| Intel fan control | Implemented, not yet hardware-validated |
+| Observed fan layout | One fan, 1,000-4,900 RPM; helper v8 write/watchdog acceptance pending |
 
 Compatibility is intentionally stated narrowly. A successful build does not
-prove that a new Mac exposes compatible writable SMC fan keys. Please report
-verified models through the
+prove that a new Mac exposes compatible writable SMC fan keys. See the
+[M-series compatibility matrix](docs/COMPATIBILITY.md) and report verified models through the
 [hardware compatibility issue form](https://github.com/girginomer10/thermofan-macos/issues/new?template=hardware_compatibility.yml).
 
 ## Build and Install
@@ -83,8 +85,11 @@ ditto dist/ThermoFan.app /Applications/ThermoFan.app
 open /Applications/ThermoFan.app
 ```
 
-The build script creates an ad-hoc signed app bundle at
-`dist/ThermoFan.app`. Current releases are source-only and are not notarized.
+The build script creates an arm64, Hardened Runtime app bundle with an ad-hoc
+development signature at `dist/ThermoFan.app`. Current releases are source-only
+and are not notarized. The guarded Developer ID/notarization workflow and its
+remaining public-release gate are documented in
+[Direct Distribution](docs/DISTRIBUTION.md).
 
 On the first hardware-control attempt, ThermoFan asks for administrator
 authorization once and installs:
@@ -94,10 +99,10 @@ authorization once and installs:
 ```
 
 The helper is root-owned, narrowly accepts fan-control commands, clamps RPM to
-the range reported by the SMC, and verifies mode and target writes. Version
-0.2.4 can keep using a verified v4 `local.codex.ThermoFan.helper` without a new
-password prompt. The optional Helper update moves it to the public identity and
-removes the legacy path.
+the range reported by the SMC, and verifies mode and target writes. Helper v8
+adds current M-series mode-key discovery, serialized writes, and a verified
+pre-write crash-watchdog handshake. Older helper protocols must update before
+another hardware write is allowed.
 
 ## Development
 
@@ -134,11 +139,14 @@ it publicly because hardware identifiers and temperature readings are included.
 
 1. A UI change is staged and marked as pending.
 2. `Apply to Hardware` installs or updates the helper if needed.
-3. The helper reads the fan count and hardware RPM range.
-4. For fixed or curve mode, it enters manual mode, writes the target, and reads
+3. A privileged watchdog must confirm that it is already observing the app.
+4. The helper reads the fan count and hardware RPM range.
+5. It discovers the firmware's per-fan mode key; an unknown control surface is
+   left read-only.
+6. For fixed or curve mode, it enters manual mode, writes the target, and reads
    both values back.
-5. A mismatch returns the fan to automatic mode and reports an error.
-6. Curve mode recalculates the target from its linked sensor or index as
+7. A mismatch returns the fan to automatic mode and reports an error.
+8. Curve mode recalculates the target from its linked sensor or index as
    temperatures change.
 
 The helper runs only on the local Mac. Its command surface, installation model,
@@ -179,6 +187,8 @@ rm -rf "$HOME/Library/Application Support/ThermoFan"
 - [Security policy](SECURITY.md)
 - [Safety model](docs/SAFETY.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Apple Silicon compatibility](docs/COMPATIBILITY.md)
+- [Direct distribution](docs/DISTRIBUTION.md)
 - [Changelog](CHANGELOG.md)
 
 ThermoFan is released under the [MIT License](LICENSE).

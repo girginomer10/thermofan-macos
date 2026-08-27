@@ -55,6 +55,20 @@ final class SensorContinuityTests: XCTestCase {
         XCTAssertEqual(SensorContinuity.removingFlatCoreSentinels(from: sensors), sensors)
     }
 
+    func testFlatSentinelSampleKeepsPreviousValidCoreReadingsAsStale() {
+        let previous = [
+            sensor(id: "Tp0G", name: "CPU Performance Core 1", temperature: 55),
+            sensor(id: "Tp0H", name: "CPU Performance Core 2", temperature: 58)
+        ]
+        let sentinel = [
+            sensor(id: "Tp0G", name: "CPU Performance Core 1", temperature: 40),
+            sensor(id: "Tp0H", name: "CPU Performance Core 2", temperature: 40)
+        ]
+        let incoming = SensorContinuity.removingFlatCoreSentinels(from: sentinel)
+
+        XCTAssertEqual(SensorContinuity.merging(incoming: incoming, previous: previous), previous)
+    }
+
     func testFlatFortyDegreeGPUCoreGroupIsRemovedWithoutRemovingOtherGPUReadings() {
         let sensors = [
             sensor(id: "TRDX", name: "GPU Die Hotspot", category: .gpu, temperature: 57),

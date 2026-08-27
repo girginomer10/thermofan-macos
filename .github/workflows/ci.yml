@@ -29,7 +29,9 @@ jobs:
         run: swift test
 
       - name: Validate build script
-        run: bash -n scripts/build_app.sh
+        run: |
+          bash -n scripts/build_app.sh
+          bash -n scripts/release_direct.sh
 
       - name: Build app bundle
         run: ./scripts/build_app.sh
@@ -38,9 +40,18 @@ jobs:
         run: |
           codesign --verify --strict dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper
           codesign --verify --deep --strict dist/ThermoFan.app
+          codesign -d --verbose=4 dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper 2>&1 | grep -Eq '^CodeDirectory .* flags=.*\(.*runtime.*\)'
+          codesign -d --verbose=4 dist/ThermoFan.app 2>&1 | grep -Eq '^CodeDirectory .* flags=.*\(.*runtime.*\)'
 
       - name: Verify bundle metadata
         run: |
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' dist/ThermoFan.app/Contents/Info.plist)" = "io.github.girginomer10.ThermoFan"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.2.5"
-          test "$(dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper --version)" = "5"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.2.6"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/ThermoFan.app/Contents/Info.plist)" = "8"
+          grep -q '^#define HELPER_VERSION "8"$' Helpers/ThermoFanHelper/main.c
+          test "$(dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper --version)" = "8"
+          grep -q '^#define EXIT_RECOVERY_REQUIRED 75$' Helpers/ThermoFanHelper/main.c
+          test "$(lipo -archs dist/ThermoFan.app/Contents/MacOS/ThermoFan)" = "arm64"
+          test "$(lipo -archs dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper)" = "arm64"
+          test "$(xcrun vtool -show-build dist/ThermoFan.app/Contents/MacOS/ThermoFan | awk '$1 == "minos" { print $2; exit }')" = "14.0"
+          test "$(xcrun vtool -show-build dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools/ThermoFanHelper | awk '$1 == "minos" { print $2; exit }')" = "14.0"

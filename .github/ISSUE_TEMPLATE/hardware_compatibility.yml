@@ -32,7 +32,7 @@ body:
     id: version
     attributes:
       label: ThermoFan version or commit
-      placeholder: 0.2.5
+      placeholder: 0.2.6
     validations:
       required: true
 
@@ -46,6 +46,15 @@ body:
         - Both SMC and PMU/HID readings available
         - Estimated fallback only
         - No readings
+    validations:
+      required: true
+
+  - type: input
+    id: mode_interface
+    attributes:
+      label: Mode interface shown by diagnostics
+      description: For example, F0Md, F0md, monitoring only, or fanless.
+      placeholder: F0md
     validations:
       required: true
 
@@ -66,6 +75,19 @@ body:
     attributes:
       label: Verified result
       description: Include fan count, range, target read-back, current RPM response, and Auto return when tested.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: wake_test
+    attributes:
+      label: Sleep/wake recovery
+      options:
+        - Not tested
+        - Returned to Auto before sleep
+        - Rediscovered and stayed Auto after wake
+        - Active setting safely reapplied after wake
+        - Recovery failed
     validations:
       required: true
 

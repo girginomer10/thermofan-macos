@@ -7,7 +7,50 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Runtime fan-control capability detection now supports both `F{i}Md` and the
+  lowercase `F{i}md` firmware family used by newer Apple Silicon Macs.
+- Deterministic M-series fixtures cover fanless, one/two-fan, uppercase,
+  lowercase, monitoring-only, sensor-family, and wake-cache behavior.
+- The direct-distribution build can produce an arm64 Developer ID/Hardened
+  Runtime bundle, with a guarded notarized-DMG release script and documented
+  public-release gates.
+
+### Changed
+
+- Fan control now fails closed when neither per-fan mode key is verified;
+  Apple's legacy `FS!` mask is no longer guessed as an Apple Silicon fallback.
+- Modern and legacy Apple Silicon CPU sensor families are probed independently
+  and selected from coherent live readings instead of the chip marketing name.
+- Missing SMC metadata is retried after wake, and temporarily missing fans keep
+  their saved configuration while hardware writes remain disabled.
+- Stale pre-wake samples are discarded, wake restoration is bounded, and a lost
+  write interface triggers verified automatic recovery instead of leaving an
+  old curve target active.
+- Fan counts and mode values now use the helper's exact decoding rules; corrupt
+  or sentinel RPM ranges above 20,000 are monitoring-only.
+- The privileged helper protocol is now version 8, requires a verified
+  pre-write crash-watchdog handshake, and serializes concurrent fan
+  transactions across helper/watchdog processes. Valid v7 ownership state is
+  migrated through verified automatic recovery before any new write.
+
 ### Fixed
+
+- The privileged watchdog now becomes ready before the first manual write;
+  one-shot fixed/curve CLI writes that cannot provide this guarantee are
+  rejected.
+- A rollback that cannot be verified is no longer collapsed into a generic
+  error; it starts bounded Auto retries while preserving watchdog recovery.
+- An Auto failure for a fan ThermoFan does not own no longer claims that a
+  watchdog is available; recovery-required status now needs matching durable
+  process ownership and the exact fan bit.
+- Durable fan ownership now records the app process start time as well as its
+  PID, so PID reuse cannot transfer recovery authority to an unrelated process.
+- App and helper binaries now both carry a real macOS 14 deployment target,
+  independently verified in the build script and CI.
+- Direct-release DMG staging now keeps candidate artifacts outside the mounted
+  payload, preventing a partial nested copy of the DMG from entering itself.
 
 - Menu-bar temperatures now use a short median window so a single transient SMC
   spike does not flash as the current hottest reading.

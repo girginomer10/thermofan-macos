@@ -110,6 +110,7 @@ final class SMCClient: @unchecked Sendable {
     // as failures so absent keys are skipped cheaply on later ticks.
     private var infoCache: [UInt32: SMCKeyInfo] = [:]
     private var missingKeys: Set<UInt32> = []
+    private let cacheLock = NSLock()
 
     static var keyDataSize: Int {
         MemoryLayout<SMCKeyData>.stride
@@ -183,7 +184,19 @@ final class SMCClient: @unchecked Sendable {
         return Self.string(fromKeyCode: output.key)
     }
 
+    /// SMC key availability can change across sleep/wake on Apple Silicon.
+    /// Metadata remains immutable within a wake cycle, but negative entries
+    /// must not survive into the next one.
+    func resetCacheAfterWake() {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        infoCache.removeAll(keepingCapacity: true)
+        missingKeys.removeAll(keepingCapacity: true)
+    }
+
     private func readInfo(key: UInt32) throws -> SMCKeyInfo {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         if let cached = infoCache[key] {
             return cached
         }

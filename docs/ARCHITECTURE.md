@@ -10,6 +10,7 @@ SMC fan writes. All sensor processing and persistence stay on the local Mac.
 | `ThermoFanApp.swift` | App lifecycle, settings window, menu bar scene |
 | `ThermalStore.swift` | Application state, refresh loop, curves, presets, recovery |
 | `HardwareProbe.swift` | Hardware discovery, persistence, helper installation and invocation |
+| `HardwareCompatibility.swift` | Capability policy and model-independent sensor candidates |
 | `SMCClient.swift` | Typed reads and writes through AppleSMC IOKit user client |
 | `HIDTemperatureReader.swift` | Apple PMU/HID temperature discovery |
 | `FanCurveMath.swift` | Curve normalization and interpolation |
@@ -36,13 +37,17 @@ by default.
 
 1. The user stages automatic, fixed, or curve mode in the UI.
 2. `ThermalStore` snapshots the staged fan setting away from the main actor.
-3. `FanControlService` invokes the installed helper with a fan index, mode, and
+3. Before any manual write, `FanControlService` starts a privileged watchdog,
+   waits for its exact readiness handshake, and retains the live process.
+4. `FanControlService` invokes the installed helper with a fan index, mode, and
    optional integer RPM.
-4. The helper validates the fan index and mode, reads the hardware RPM range,
+5. The helper validates the fan index and mode, reads the hardware RPM range,
    and clamps the target.
-5. Manual mode is written and polled before the target is written.
-6. Target and mode are read back. A mismatch restores automatic mode.
-7. Only a verified result becomes active application state.
+6. The helper tries `F{i}Md`, then `F{i}md`; without a verified per-fan mode
+   key, the fan remains monitoring-only rather than falling back to `FS!`.
+7. Manual mode is written and polled before the target is written.
+8. Target and mode are read back. A mismatch restores automatic mode.
+9. Only a verified result becomes active application state.
 
 No arbitrary SMC key, file path, command, or shell fragment can be supplied
 through the helper's command-line interface.
@@ -59,23 +64,29 @@ The bundled helper is ad-hoc signed as part of the local build. Its installer:
 - records a root-owned version marker;
 - removes the legacy helper path.
 
-An existing root-owned v4 helper at the legacy path remains usable after its
-permissions and version marker are validated. This avoids an unnecessary
-administrator prompt during migration while keeping the v5 update visible in
-General settings.
+A root-owned v8 helper at the legacy path can be migrated after its permissions
+and version marker are validated. Older v4-v7 protocols are not allowed to
+write against the expanded M-series matrix and must update first.
 
 The current implementation uses a narrowly scoped setuid helper so repeated fan
-changes do not require repeated administrator prompts. A signed and notarized
-XPC helper would be the preferred distribution model for a future binary
-release.
+changes do not require repeated administrator prompts. Replacing it with an
+embedded, authenticated `SMAppService` LaunchDaemon/XPC helper is a mandatory
+gate before a public binary release; notarization alone is not a security
+architecture review.
 
 ## Recovery
 
 - Normal quit requests automatic mode for active hardware-controlled fans.
-- A detached helper watches the launching app process and restores automatic
-  mode if that process exits.
+- A detached helper proves it is watching the launching app before manual
+  control begins and restores only fan bits owned by that exact PID and process
+  start identity if it exits.
 - A failed fixed or curve write restores automatic mode before returning.
-- On wake, active curve or fixed settings are reapplied and verified.
+- An unverified rollback has a dedicated helper exit/result path and starts a
+  bounded in-process Auto retry sequence without discarding watchdog ownership.
+- On wake, stale pre-wake samples are discarded; active curve or fixed settings
+  are retried within a bound, then verified back to automatic control on error.
+- If a live fan loses its verified write interface, the UI leaves the active
+  state and automatic recovery is retried while manual writes remain disabled.
 
 Recovery is best-effort because macOS, SMC firmware, power loss, and forced
 process termination can interrupt any software path.
