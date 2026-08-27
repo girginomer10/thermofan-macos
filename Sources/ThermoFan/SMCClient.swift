@@ -1,4 +1,5 @@
 import Foundation
+import FanSafetyPolicy
 import IOKit
 import Darwin
 
@@ -123,7 +124,7 @@ final class SMCClient: @unchecked Sendable {
         }
         defer { IOObjectRelease(service) }
 
-        let result = IOServiceOpen(service, mach_task_self_, 0, &connection)
+        let result = IOServiceOpen(service, thermofan_current_task_port(), 0, &connection)
         guard result == KERN_SUCCESS else {
             throw SMCError.openFailed(result)
         }

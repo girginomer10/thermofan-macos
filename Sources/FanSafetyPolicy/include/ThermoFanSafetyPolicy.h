@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <mach/mach_types.h>
 
 #define THERMOFAN_LEGACY_FAN_STATE_SIZE 28u
 
@@ -42,5 +43,9 @@ int32_t thermofan_decode_legacy_fan_state(
 int32_t thermofan_legacy_migration_allows_new_write(
     int32_t automatic_recovery_verified
 );
+
+/// Returns the caller's Mach task port through C so Swift 6.0 does not import
+/// the SDK's mutable mach_task_self_ compatibility global directly.
+mach_port_t thermofan_current_task_port(void);
 
 #endif

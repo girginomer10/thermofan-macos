@@ -78,6 +78,9 @@ and the project uses semantic versioning while it remains pre-1.0.
   build, passing tests, a build number tied to the helper revision, zero
   notary-log issues, post-staple mounted-payload verification, and a SHA-bound
   evidence plist. CI covers arm64 macOS 14, 15, and 26.
+- The macOS 14 Swift 6.0 build no longer imports the SDK's mutable
+  `mach_task_self_` global directly or relies on newer actor/function-reference
+  inference accepted only by later Swift 6 toolchains.
 
 - Menu-bar temperatures now use a short median window so a single transient SMC
   spike does not flash as the current hottest reading.

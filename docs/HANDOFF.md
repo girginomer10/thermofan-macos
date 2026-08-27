@@ -118,7 +118,8 @@
   Developer ID/notarized-DMG release pipeline with SHA-bound evidence. CI now
   covers arm64 macOS 14, 15, and 26, pins third-party actions by commit, and
   exposes the aggregate `Build and test` result required by branch protection;
-  the macOS 14 runner explicitly selects its installed Swift 6 toolchain.
+  the macOS 14 runner explicitly selects its installed Swift 6 toolchain, and
+  the shared source avoids SDK/import patterns rejected by Swift 6.0.
 - Verified: `swift test` (54 passed), production app/helper build, strict Swift/C
   warning and analyzer checks, strict app/helper code-signature checks,
   Hardened Runtime, arm64-only binaries, macOS 14 deployment targets, mode

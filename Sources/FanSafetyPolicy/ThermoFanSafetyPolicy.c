@@ -1,5 +1,6 @@
 #include "ThermoFanSafetyPolicy.h"
 
+#include <mach/mach_init.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -99,4 +100,8 @@ int32_t thermofan_legacy_migration_allows_new_write(
     int32_t automatic_recovery_verified
 ) {
     return automatic_recovery_verified == 1;
+}
+
+mach_port_t thermofan_current_task_port(void) {
+    return mach_task_self();
 }

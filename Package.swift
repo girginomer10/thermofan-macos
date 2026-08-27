@@ -41,7 +41,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "ThermoFan",
-            dependencies: ["FanControlXPC"],
+            dependencies: ["FanControlXPC", "FanSafetyPolicy"],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("IOKit"),

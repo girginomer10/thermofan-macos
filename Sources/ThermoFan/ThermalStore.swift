@@ -494,7 +494,9 @@ final class ThermalStore: ObservableObject {
         applyCurveTargets()
         save()
         let fanIDs = fans.compactMap { preset.fanSettings[$0.id] == nil ? nil : $0.id }
-        fanIDs.forEach(applyFanWithAdmin)
+        for fanID in fanIDs {
+            applyFanWithAdmin(fanID)
+        }
     }
 
     func deletePreset(_ preset: FanPreset) {
@@ -820,7 +822,7 @@ final class ThermalStore: ObservableObject {
         }
     }
 
-    private static func migratedSensorID(_ id: String) -> String {
+    nonisolated private static func migratedSensorID(_ id: String) -> String {
         switch id {
         case "cpu-average": "index-cpu-average"
         case "gpu-average": "index-gpu-average"
