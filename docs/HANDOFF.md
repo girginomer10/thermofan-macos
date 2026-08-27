@@ -116,7 +116,8 @@
   recovery, stable update/unregister recovery, automatic legacy-helper
   retirement, registration/approval/recovery UI states, and an arm64
   Developer ID/notarized-DMG release pipeline with SHA-bound evidence. CI now
-  covers arm64 macOS 14, 15, and 26 and pins third-party actions by commit.
+  covers arm64 macOS 14, 15, and 26, pins third-party actions by commit, and
+  exposes the aggregate `Build and test` result required by branch protection.
 - Verified: `swift test` (54 passed), production app/helper build, strict Swift/C
   warning and analyzer checks, strict app/helper code-signature checks,
   Hardened Runtime, arm64-only binaries, macOS 14 deployment targets, mode

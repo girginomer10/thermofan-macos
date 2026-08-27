@@ -78,3 +78,15 @@ jobs:
           HELPER_STRINGS="$(strings dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper)"
           ! grep -Eq -- '--fanctl|--watch|THERMOFAN_WATCHDOG_READY|osascript' <<<"$APP_STRINGS"
           ! grep -Eq -- '--fanctl|--watch|THERMOFAN_WATCHDOG_READY|osascript' <<<"$HELPER_STRINGS"
+
+  required:
+    name: Build and test
+    if: ${{ always() }}
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every macOS matrix job
+        env:
+          MATRIX_RESULT: ${{ needs.build-and-test.result }}
+        run: test "$MATRIX_RESULT" = "success"
