@@ -28,6 +28,7 @@ enum CommandLineEntrypoint {
 
         print("ThermoFan diagnostics")
         print("Machine: \(snapshot.machine.modelIdentifier) / \(snapshot.machine.chipName) / \(snapshot.machine.osVersion)")
+        print("macOS build: \(HardwareProbe.sysctlString("kern.osversion") ?? "unknown")")
         print("SMC open: \(probe.isSMCAvailable ? "yes" : "no")")
         print("SMC key data size: \(SMCClient.keyDataSize)")
         print("Real temperature sensors: \(realSensors.count) (\(smcSensors.count) SMC, \(systemSensors.count) system)")
@@ -40,7 +41,8 @@ enum CommandLineEntrypoint {
 
         print("Real fans: \(realFans.count)")
         for fan in realFans {
-            print("  \(fan.id)  \(fan.name): current \(fan.currentRPM) RPM, target \(fan.targetRPM) RPM, range \(fan.minRPM)-\(fan.maxRPM), \(fan.controlInterface.diagnosticLabel)")
+            let rawTarget = fan.hardwareTargetRPM.map { "\($0) RPM" } ?? "unreadable"
+            print("  \(fan.id)  \(fan.name): current \(fan.currentRPM) RPM, hardware mode \(hardwareModeLabel(fan.hardwareMode)), raw target \(rawTarget), staged target \(fan.targetRPM) RPM, range \(fan.minRPM)-\(fan.maxRPM), \(fan.controlInterface.diagnosticLabel)")
         }
         if realFans.isEmpty {
             print("  none")
@@ -52,23 +54,42 @@ enum CommandLineEntrypoint {
         }
 
         print("Raw SMC key reads:")
-        runRawReads()
+        runRawReads(discoveredFanIndexes: realFans.compactMap { Int($0.id.dropFirst("fan".count)) })
         print("Interesting SMC keys:")
         runKeyEnumeration()
     }
 
-    private static func runRawReads() {
-        let keys = [
-            "#KEY", "FNum", "FS! ", "Ftst", "F0Ac", "F0Mn", "F0Mx", "F0Tg", "F0Md", "F0md", "F0St", "F0Dc", "F0CR",
-            "F0TE", "F0S0", "F0S1", "F0S2", "F0S3", "F0S4", "F0S5", "F0S6", "F0S7",
-            "spf0", "RPF0", "SFF0", "SEF0", "SEf0", "maF0", "mxF0", "rtF0", "of00", "oF00", "isF0",
-            "F1Ac", "F1Mn", "F1Mx", "F1Tg", "F1Md", "F1md",
-            "TA0P", "TC0P", "TC0E", "TC0D", "TC1C", "TC2C", "Tp09", "Tp01",
-            "TG0P", "TG0D", "Tg05", "Tp0P", "TW0P", "TB0T", "TS0P"
-        ]
+    private static func hardwareModeLabel(_ mode: FanMode?) -> String {
+        switch mode {
+        case .automatic?: "auto"
+        case .fixed?: "manual"
+        case .curve?: "curve"
+        case nil: "unknown"
+        }
+    }
 
+    private static func runRawReads(discoveredFanIndexes: [Int]) {
         do {
             let smc = try SMCClient()
+            // Every fan index the SMC reports or the probe exposed, plus 0 and
+            // 1 so a missing or zero FNum still shows what those keys hold.
+            let reportedFanCount = SMCNumericPolicy.fanCount(try? smc.readNumber(key: "FNum").value) ?? 0
+            let fanIndexes = Set(0..<max(reportedFanCount, 2))
+                .union(discoveredFanIndexes)
+                .filter { (0..<SMCNumericPolicy.maximumFanCount).contains($0) }
+                .sorted()
+            let fanKeys = fanIndexes.flatMap { index in
+                ["Ac", "Mn", "Mx", "Tg", "Md", "md"].map { "F\(index)\($0)" }
+            }
+            let keys: [String] = ["#KEY", "FNum", "FS! ", "Ftst"]
+                + fanKeys
+                + [
+                    "F0St", "F0Dc", "F0CR", "F0TE", "F0S0", "F0S1", "F0S2", "F0S3", "F0S4", "F0S5", "F0S6", "F0S7",
+                    "spf0", "RPF0", "SFF0", "SEF0", "SEf0", "maF0", "mxF0", "rtF0", "of00", "oF00", "isF0",
+                    "TA0P", "TC0P", "TC0E", "TC0D", "TC1C", "TC2C", "Tp09", "Tp01",
+                    "TG0P", "TG0D", "Tg05", "Tp0P", "TW0P", "TB0T", "TS0P"
+                ]
+
             for key in keys {
                 do {
                     let raw = try smc.readRaw(key: key)
@@ -104,9 +125,7 @@ enum CommandLineEntrypoint {
                 }
                 if key.hasPrefix("T"),
                    let reading = try? smc.readNumber(key: key),
-                   reading.value.isFinite,
-                   reading.value >= 10,
-                   reading.value < 130 {
+                   TemperaturePlausibility.isPlausible(reading.value) {
                     temperatureReadings.append(reading)
                 }
             }

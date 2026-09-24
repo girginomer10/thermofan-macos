@@ -5,9 +5,10 @@ import Darwin
 
 private let kSMCKernelIndex: UInt32 = 2
 private let kSMCReadBytes: UInt8 = 5
-private let kSMCWriteBytes: UInt8 = 6
 private let kSMCGetKeyFromIndex: UInt8 = 8
 private let kSMCReadKeyInfo: UInt8 = 9
+/// `kSMCKeyNotFound`: the only SMC result that proves a key does not exist.
+private let kSMCKeyNotFound: UInt8 = 0x84
 
 private struct SMCVersion {
     var major: UInt8 = 0
@@ -76,6 +77,7 @@ enum SMCError: Error, LocalizedError, CustomStringConvertible {
     case callFailed(kern_return_t)
     case smcResult(UInt8)
     case unknownType(String)
+    case malformedData(type: String, byteCount: Int)
 
     var errorDescription: String? {
         switch self {
@@ -89,6 +91,8 @@ enum SMCError: Error, LocalizedError, CustomStringConvertible {
             return "SMC returned error 0x\(String(result, radix: 16))."
         case .unknownType(let type):
             return "Unsupported SMC data type '\(type)'."
+        case .malformedData(let type, let byteCount):
+            return "SMC returned \(byteCount) byte\(byteCount == 1 ? "" : "s") that do not decode as '\(type)'."
         }
     }
 
@@ -97,18 +101,22 @@ enum SMCError: Error, LocalizedError, CustomStringConvertible {
     }
 
     private static func kernMessage(_ code: kern_return_t) -> String {
+        let hexCode = "0x\(String(UInt32(bitPattern: code), radix: 16))"
         if let message = mach_error_string(code) {
-            return String(cString: message)
+            return "\(String(cString: message)) (\(hexCode))"
         }
-        return "kern_return_t \(code)"
+        return "kern_return_t \(hexCode)"
     }
 }
 
+/// Read-only AppleSMC client for the app process. It deliberately has no
+/// write entry point: every fan write goes through the privileged daemon.
 final class SMCClient: @unchecked Sendable {
     private var connection: io_connect_t = 0
-    // Key metadata (size/type) is immutable per boot, so cache it to avoid a
-    // second kernel round-trip on every read/write. Nonexistent keys are cached
-    // as failures so absent keys are skipped cheaply on later ticks.
+    // Key metadata (size/type) is immutable within a wake cycle, so cache it
+    // to avoid a second kernel round-trip on every read. Only keys the SMC
+    // reports as nonexistent (`kSMCKeyNotFound`) are cached as missing; a busy,
+    // timed-out, or otherwise failed lookup is retried on the next read.
     private var infoCache: [UInt32: SMCKeyInfo] = [:]
     private var missingKeys: Set<UInt32> = []
     private let cacheLock = NSLock()
@@ -159,22 +167,6 @@ final class SMCClient: @unchecked Sendable {
         return SMCRawReading(key: key, type: type, bytes: bytes)
     }
 
-    func writeNumber(key: String, value: Double) throws {
-        let rawKey = Self.keyCode(key)
-        let info = try readInfo(key: rawKey)
-        let type = Self.string(fromKeyCode: info.dataType)
-        let encoded = try Self.encode(value: value, type: type, count: Int(info.dataSize))
-
-        var input = SMCKeyData()
-        var output = SMCKeyData()
-        input.key = rawKey
-        input.keyInfo = info
-        input.data8 = kSMCWriteBytes
-        Self.copy(encoded, into: &input.bytes)
-        try call(selector: kSMCKernelIndex, input: &input, output: &output)
-        try Self.checkSMCResult(output.result)
-    }
-
     func key(at index: Int) throws -> String {
         var input = SMCKeyData()
         var output = SMCKeyData()
@@ -202,19 +194,18 @@ final class SMCClient: @unchecked Sendable {
             return cached
         }
         if missingKeys.contains(key) {
-            throw SMCError.smcResult(0x84)
+            throw SMCError.smcResult(kSMCKeyNotFound)
         }
         var input = SMCKeyData()
         var output = SMCKeyData()
         input.key = key
         input.data8 = kSMCReadKeyInfo
+        // A transport failure throws here without touching either cache.
         try call(selector: kSMCKernelIndex, input: &input, output: &output)
-        do {
-            try Self.checkSMCResult(output.result)
-        } catch {
+        if output.result == kSMCKeyNotFound {
             missingKeys.insert(key)
-            throw error
         }
+        try Self.checkSMCResult(output.result)
         infoCache[key] = output.keyInfo
         return output.keyInfo
     }
@@ -282,31 +273,29 @@ final class SMCClient: @unchecked Sendable {
         }
     }
 
-    private static func copy(_ bytes: [UInt8], into tuple: inout SMCBytes) {
-        withUnsafeMutableBytes(of: &tuple) { rawBuffer in
-            for index in rawBuffer.indices {
-                rawBuffer[index] = 0
-            }
-            for index in 0..<min(bytes.count, rawBuffer.count) {
-                rawBuffer[index] = bytes[index]
+    /// Decodes an SMC payload by its declared data type. A payload that is too
+    /// short for its type, or a float that is implausible in both byte orders,
+    /// throws instead of decoding as 0: a synthesized 0 would read as a
+    /// confirmed fanless `FNum` or as Auto for a fan-mode key.
+    static func decode(bytes: [UInt8], type: String) throws -> Double {
+        func require(_ count: Int) throws {
+            guard bytes.count >= count else {
+                throw SMCError.malformedData(type: type, byteCount: bytes.count)
             }
         }
-    }
-
-    private static func decode(bytes: [UInt8], type: String) throws -> Double {
-        guard !bytes.isEmpty else { return 0 }
 
         switch type {
         case "sp78":
+            try require(1)
             let integer = Int8(bitPattern: bytes[0])
             let fraction = bytes.count > 1 ? Double(bytes[1]) / 256 : 0
             return Double(integer) + fraction
         case "fpe2":
-            guard bytes.count >= 2 else { return 0 }
+            try require(2)
             let raw = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
             return Double(raw) / 4
         case "flt", "flt ":
-            guard bytes.count >= 4 else { return 0 }
+            try require(4)
             let bigEndian = UInt32(bytes[0]) << 24 | UInt32(bytes[1]) << 16 | UInt32(bytes[2]) << 8 | UInt32(bytes[3])
             let littleEndian = UInt32(bytes[3]) << 24 | UInt32(bytes[2]) << 16 | UInt32(bytes[1]) << 8 | UInt32(bytes[0])
             let bigFloat = Float32(bitPattern: bigEndian)
@@ -327,55 +316,21 @@ final class SMCClient: @unchecked Sendable {
             if bigFloat.isFinite, abs(bigFloat) < 200_000 {
                 return Double(bigFloat)
             }
-            return 0
+            throw SMCError.malformedData(type: type, byteCount: bytes.count)
         case "ui8", "ui8 ":
+            try require(1)
             return Double(bytes[0])
         case "ui16":
-            guard bytes.count >= 2 else { return 0 }
+            try require(2)
             return Double(UInt16(bytes[0]) << 8 | UInt16(bytes[1]))
         case "ui32":
-            guard bytes.count >= 4 else { return 0 }
+            try require(4)
             return Double(UInt32(bytes[0]) << 24 | UInt32(bytes[1]) << 16 | UInt32(bytes[2]) << 8 | UInt32(bytes[3]))
         case "si16":
-            guard bytes.count >= 2 else { return 0 }
+            try require(2)
             let raw = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
             return Double(Int16(bitPattern: raw))
         default:
-            throw SMCError.unknownType(type)
-        }
-    }
-
-    private static func encode(value: Double, type: String, count: Int) throws -> [UInt8] {
-        switch type {
-        case "fpe2":
-            let raw = UInt16(max(0, min(65535, Int(value * 4))))
-            return [UInt8((raw >> 8) & 0xff), UInt8(raw & 0xff)]
-        case "ui8", "ui8 ":
-            return [UInt8(max(0, min(255, Int(value))))]
-        case "ui16":
-            let raw = UInt16(max(0, min(65535, Int(value))))
-            return [UInt8((raw >> 8) & 0xff), UInt8(raw & 0xff)]
-        case "ui32":
-            let raw = UInt32(max(0, Int(value)))
-            return [
-                UInt8((raw >> 24) & 0xff),
-                UInt8((raw >> 16) & 0xff),
-                UInt8((raw >> 8) & 0xff),
-                UInt8(raw & 0xff)
-            ]
-        case "flt", "flt ":
-            let raw = Float32(value).bitPattern
-            return [
-                UInt8(raw & 0xff),
-                UInt8((raw >> 8) & 0xff),
-                UInt8((raw >> 16) & 0xff),
-                UInt8((raw >> 24) & 0xff)
-            ]
-        default:
-            if count == 2 {
-                let raw = UInt16(max(0, min(65535, Int(value))))
-                return [UInt8((raw >> 8) & 0xff), UInt8(raw & 0xff)]
-            }
             throw SMCError.unknownType(type)
         }
     }

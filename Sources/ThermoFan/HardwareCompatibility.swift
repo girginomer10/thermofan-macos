@@ -5,6 +5,10 @@ import Foundation
 /// model identifier implies a particular write path.
 enum FanControlInterface: Hashable {
     case perFanMode(key: String)
+    /// Legacy Intel/T2 `FS!` bitmask. Test-only: production code never passes
+    /// `allowForceMask: true`, so the app never selects this interface on
+    /// Apple Silicon (and the app process never writes to the SMC at all).
+    /// The case stays so fixtures keep the mask decoding covered.
     case forceMask(key: String)
     case unavailable
 
@@ -27,6 +31,8 @@ enum FanControlInterface: Hashable {
 enum FanControlInterfacePolicy {
     static let forceMaskKey = "FS! "
 
+    /// - Parameter allowForceMask: Test-only. Production callers must leave it
+    ///   `false`; `FS!` is never a fallback on Apple Silicon.
     static func detect(
         fanIndex: Int,
         allowForceMask: Bool = false,
@@ -105,13 +111,37 @@ enum SMCNumericPolicy {
     }
 }
 
+/// Plausibility window shared by the SMC and HID temperature paths. Values
+/// outside it are firmware sentinels (for example -1/-2 C PMU channels or
+/// unused channels reading near 0 C) or decoding errors, not measurements.
+enum TemperaturePlausibility {
+    static let celsiusRange: Range<Double> = 10..<130
+
+    static func isPlausible(_ celsius: Double) -> Bool {
+        celsius.isFinite && celsiusRange.contains(celsius)
+    }
+}
+
 struct SMCSensorDefinition: Hashable {
     var key: String
     var name: String
     var category: SensorCategory
 }
 
+/// The two mutually exclusive CPU-core key families. `HardwareProbe` picks
+/// one per app session and never switches, so a key cannot change meaning
+/// (name or category) between samples.
+enum SMCCoreFamily: Hashable {
+    case modern
+    case legacy
+}
+
 enum SMCSensorCatalog {
+    /// `Tp0P` is a CPU performance core in the modern family but the power
+    /// manager die on firmware that uses the legacy family. `HardwareProbe`
+    /// fixes its meaning once per session.
+    static let dualMeaningKey = "Tp0P"
+
     static let common: [SMCSensorDefinition] = [
         SMCSensorDefinition(key: "TA0P", name: "Airport Proximity", category: .ambient),
         SMCSensorDefinition(key: "TA0p", name: "Ambient Proximity", category: .ambient),
@@ -153,16 +183,42 @@ enum SMCSensorCatalog {
         SMCSensorDefinition(key: "TS0P", name: "SSD Proximity", category: .storage)
     ]
 
-    static let gpuCoreCandidates: [SMCSensorDefinition] = {
-        let keys = (0...2).flatMap { bank in
-            Array("abcdefgh").map { suffix in
-                "Tg\(bank)\(suffix)"
+    static let gpuCoreNamePrefix = "GPU Core"
+
+    /// Per-core GPU candidates `Tg{bank}{a...h}`. Firmware exposes a sparse,
+    /// model-dependent subset (for example `Tg0d`, `Tg0e`, `Tg1c`, `Tg1d` on
+    /// an M4 Pro), so candidates carry no slot number; the probe names the
+    /// discovered keys densely with `numberingGPUCores(_:assigned:)`.
+    static let gpuCoreCandidates: [SMCSensorDefinition] = (0...2).flatMap { bank in
+        Array("abcdefgh").map { suffix in
+            SMCSensorDefinition(key: "Tg\(bank)\(suffix)", name: gpuCoreNamePrefix, category: .gpu)
+        }
+    }
+
+    /// Names GPU-core readings "GPU Core N" (category `.gpu`). Numbers are
+    /// dense and assigned, in the given (catalog) order, the first time each
+    /// key is published; `assigned` is the session's key-to-number table, so
+    /// a key keeps its name for the whole session even when another key
+    /// sleeps or first appears later. Pass readings that already went through
+    /// `removingFlatSentinelGroups(from:)` so sentinel keys consume no number.
+    static func numberingGPUCores(
+        _ sensors: [ThermalSensor],
+        assigned: inout [String: Int]
+    ) -> [ThermalSensor] {
+        sensors.map { sensor in
+            let number: Int
+            if let existing = assigned[sensor.id] {
+                number = existing
+            } else {
+                number = assigned.count + 1
+                assigned[sensor.id] = number
             }
+            var named = sensor
+            named.name = "\(gpuCoreNamePrefix) \(number)"
+            named.category = .gpu
+            return named
         }
-        return keys.enumerated().map { offset, key in
-            SMCSensorDefinition(key: key, name: "GPU Core \(offset + 1)", category: .gpu)
-        }
-    }()
+    }
 
     static let modernPerformanceCandidates: [SMCSensorDefinition] = {
         let keys = ["Tp0G", "Tp0H", "Tp0I", "Tp0K", "Tp0L", "Tp0M", "Tp0O", "Tp0P", "Tp0Q", "Tp0S"]
@@ -182,25 +238,49 @@ enum SMCSensorCatalog {
         SMCSensorDefinition(key: "Tp0D", name: "CPU Performance Core 3", category: .cpu)
     ]
 
-    static func selectingCoreFamily(
-        modern: [ThermalSensor],
-        legacy: [ThermalSensor]
-    ) -> [ThermalSensor] {
-        let validModern = isUniformFortyCoreFamily(modern)
-            ? []
-            : SensorContinuity.removingFlatCoreSentinels(from: modern)
-        let validLegacy = isUniformFortyCoreFamily(legacy)
-            ? []
-            : SensorContinuity.removingFlatCoreSentinels(from: legacy)
+    /// Picks the family with the stronger coherent group of real core
+    /// readings, or nil while neither yields at least two. The probe asks only
+    /// until this returns a family and then keeps that answer for the session.
+    static func coreFamily(modern: [ThermalSensor], legacy: [ThermalSensor]) -> SMCCoreFamily? {
+        let modernCoreCount = validCores(modern).filter { $0.category == .cpu }.count
+        let legacyCoreCount = validCores(legacy).filter { $0.category == .cpu }.count
+        guard max(modernCoreCount, legacyCoreCount) >= 2 else { return nil }
+        return modernCoreCount >= legacyCoreCount ? .modern : .legacy
+    }
 
-        let modernCoreCount = validModern.filter { $0.category == .cpu }.count
-        let legacyCoreCount = validLegacy.filter { $0.category == .cpu }.count
-        guard max(modernCoreCount, legacyCoreCount) >= 2 else { return [] }
-        return modernCoreCount >= legacyCoreCount ? validModern : validLegacy
+    /// Real readings of one core family: a family that reads a uniform 40 C
+    /// is a firmware sentinel and is dropped whole, as are flat sub-groups.
+    static func validCores(_ family: [ThermalSensor]) -> [ThermalSensor] {
+        isUniformFortyCoreFamily(family) ? [] : removingFlatSentinelGroups(from: family)
     }
 
     static func isUniformFortyCoreFamily(_ sensors: [ThermalSensor]) -> Bool {
         sensors.count >= 2 && sensors.allSatisfy { abs($0.temperatureC - 40) < 0.01 }
+    }
+
+    /// Name markers of the SMC per-core groups that some firmware report as a
+    /// flat 40 C sentinel. `SensorContinuity.removingFlatCoreSentinels` only
+    /// knows the performance-core and GPU-core markers, so the probe filters
+    /// every catalog group (including efficiency cores and `Te0x` efficiency
+    /// sensors) here before publishing.
+    static let flatSentinelGroupMarkers = [
+        "Performance Core",
+        "Efficiency Core",
+        "Efficiency Sensor",
+        gpuCoreNamePrefix
+    ]
+
+    /// Removes each marker group that has at least two members and reads a
+    /// uniform 40 C. Groups that vary are kept whole.
+    static func removingFlatSentinelGroups(from sensors: [ThermalSensor]) -> [ThermalSensor] {
+        var result = sensors
+        for marker in flatSentinelGroupMarkers {
+            let group = result.filter { $0.name.localizedCaseInsensitiveContains(marker) }
+            guard isUniformFortyCoreFamily(group) else { continue }
+            let sentinelIDs = Set(group.map(\.id))
+            result.removeAll { sentinelIDs.contains($0.id) }
+        }
+        return result
     }
 }
 

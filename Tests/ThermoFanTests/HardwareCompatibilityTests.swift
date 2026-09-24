@@ -122,7 +122,9 @@ final class HardwareCompatibilityTests: XCTestCase {
         let snapshot = probe(smc).sample(preferences: .defaults)
 
         XCTAssertEqual(snapshot.fans.first?.controlInterface, .unavailable)
-        XCTAssertNil(snapshot.fans.first?.hardwareMode)
+        // The mode register is still readable, so its true value is reported.
+        XCTAssertEqual(snapshot.fans.first?.hardwareMode, .automatic)
+        XCTAssertNil(snapshot.fans.first?.hardwareTargetRPM)
     }
 
     func testLegacyCoreFamilyIsStillDiscoveredOnAnMSeriesName() {
@@ -150,6 +152,36 @@ final class HardwareCompatibilityTests: XCTestCase {
         XCTAssertFalse(snapshot.sensors.contains { $0.name.contains("Performance Core") })
         XCTAssertFalse(snapshot.sensors.contains { $0.name.contains("Efficiency Core") })
         XCTAssertFalse(snapshot.sensors.contains { $0.id == "Tp0P" })
+    }
+
+    func testSystemSensorSupplementLatchesForTheSession() {
+        let smc = FakeSMC(values: ["FNum": 0], temperatures: ["TPMP": 48, "TCMz": 55])
+        let die = ThermalSensor(
+            id: "hid-pmu-tdie1-1",
+            name: "PMU Die 1",
+            category: .cpu,
+            temperatureC: 52,
+            source: .system,
+            isFavorite: false,
+            isHidden: false,
+            updatedAt: Date()
+        )
+        let hardwareProbe = probe(smc, hid: FakeHID(sensors: [die]))
+
+        // Two SMC sensors are too thin a topology, so HID supplements it.
+        XCTAssertTrue(hardwareProbe.sample(preferences: .defaults).sensors.contains { $0.id == die.id })
+
+        // A richer SMC topology later in the session must not drop it again.
+        smc.values.merge(["TC0P": 50, "TG0P": 45, "TPDX": 53]) { _, new in new }
+        XCTAssertTrue(hardwareProbe.sample(preferences: .defaults).sensors.contains { $0.id == die.id })
+    }
+
+    func testSMCDecodeHandlesDeclaredByteLayouts() throws {
+        XCTAssertEqual(try SMCClient.decode(bytes: [0x2A, 0x80], type: "sp78"), 42.5)
+        XCTAssertEqual(try SMCClient.decode(bytes: [0x13, 0x88], type: "fpe2"), 1_250)
+        XCTAssertEqual(try SMCClient.decode(bytes: [0x00, 0x50, 0x9A, 0x44], type: "flt"), 1_234.5)
+        XCTAssertEqual(try SMCClient.decode(bytes: [0x07, 0xD0], type: "ui16"), 2_000)
+        XCTAssertThrowsError(try SMCClient.decode(bytes: [0x07], type: "ui16"))
     }
 
     func testWakeClearsReaderNegativeCache() {
@@ -321,10 +353,10 @@ final class HardwareCompatibilityTests: XCTestCase {
         )
     }
 
-    private func probe(_ smc: FakeSMC) -> HardwareProbe {
+    private func probe(_ smc: FakeSMC, hid: FakeHID = FakeHID()) -> HardwareProbe {
         HardwareProbe(
             smc: smc,
-            hidReader: FakeHID(),
+            hidReader: hid,
             modelIdentifier: "FixtureMac",
             chipName: "Apple M Fixture",
             osVersion: "macOS Fixture"
@@ -333,11 +365,13 @@ final class HardwareCompatibilityTests: XCTestCase {
 }
 
 private final class FakeSMC: SMCReadingProviding {
-    private let values: [String: Double]
+    var values: [String: Double]
     private(set) var resetCount = 0
 
-    init(values: [String: Double]) {
-        self.values = values
+    /// Fixtures carry one plausible SoC temperature by default so the probe's
+    /// "no temperature readings" warning does not affect fan-topology tests.
+    init(values: [String: Double], temperatures: [String: Double] = ["TPMP": 48]) {
+        self.values = values.merging(temperatures) { fixture, _ in fixture }
     }
 
     func readNumber(key: String) throws -> SMCReading {
@@ -353,5 +387,11 @@ private final class FakeSMC: SMCReadingProviding {
 }
 
 private final class FakeHID: HIDTemperatureReadingProviding {
-    func readSensors() -> [ThermalSensor] { [] }
+    private let sensors: [ThermalSensor]
+
+    init(sensors: [ThermalSensor] = []) {
+        self.sensors = sensors
+    }
+
+    func readSensors() -> [ThermalSensor] { sensors }
 }
