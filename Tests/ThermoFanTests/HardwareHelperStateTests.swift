@@ -5,19 +5,15 @@ import ServiceManagement
 @testable import ThermoFan
 
 final class HardwareHelperStateTests: XCTestCase {
-    func testOnlyAuthenticatedReadyHelperIsUsable() {
-        XCTAssertFalse(HardwareHelperState.missing.isUsable)
-        XCTAssertFalse(HardwareHelperState.legacyCleanupRequired.isUsable)
-        XCTAssertFalse(HardwareHelperState.approvalRequired.isUsable)
-        XCTAssertFalse(HardwareHelperState.updateRequired.isUsable)
-        XCTAssertFalse(HardwareHelperState.recoveryBlocked.isUsable)
-        XCTAssertTrue(HardwareHelperState.ready.isUsable)
-    }
+    private static let allStates: [HardwareHelperState] = [
+        .missing, .legacyCleanupRequired, .approvalRequired, .updateRequired, .recoveryBlocked,
+        .ready, .monitoringOnly, .wrongLocation, .inactiveSession, .unreachable
+    ]
 
-    func testSetuidLegacyFallbackIsRemovedInProtocolV9() {
-        XCTAssertEqual(FanControlService.expectedHelperVersion, "9")
-        XCTAssertNil(FanControlService.compatibleLegacyHelperVersion)
-        XCTAssertEqual(FanControlService.recoveryRequiredExitCode, 75)
+    func testOnlyAuthenticatedReadyHelperIsUsable() {
+        for state in Self.allStates {
+            XCTAssertEqual(state.isUsable, state == .ready, "\(state)")
+        }
     }
 
     func testAdHocTestHostCannotConstructAPrivilegedPeerRequirement() {
@@ -66,44 +62,103 @@ final class HardwareHelperStateTests: XCTestCase {
         XCTAssertNotNil(handshakeDescription.name)
     }
 
-    func testServiceStatusRequiresLiveCurrentHandshake() {
-        let ready = PrivilegedFanClient.Handshake(
-            protocolVersion: ThermoFanXPC.protocolVersion,
-            implementationRevision: ThermoFanXPC.implementationRevision,
-            status: 0,
-            message: "ready"
-        )
-        let stale = PrivilegedFanClient.Handshake(
-            protocolVersion: ThermoFanXPC.protocolVersion,
-            implementationRevision: ThermoFanXPC.implementationRevision - 1,
-            status: 0,
-            message: "stale"
-        )
-        let blocked = PrivilegedFanClient.Handshake(
-            protocolVersion: ThermoFanXPC.protocolVersion,
-            implementationRevision: ThermoFanXPC.implementationRevision,
-            status: ThermoFanXPC.recoveryRequiredStatus,
-            message: "blocked"
+    func testBuildLevelStatesDoNotDependOnLaunchdOrTheDaemon() {
+        let ready = Self.handshake(status: 0)
+
+        XCTAssertEqual(state(isDeveloperID: false, handshake: .success(ready)), .monitoringOnly)
+        XCTAssertEqual(state(isDeveloperID: false, isInApplications: false), .monitoringOnly)
+        XCTAssertEqual(state(bundleContainsDaemon: false, handshake: .success(ready)), .monitoringOnly)
+        XCTAssertEqual(state(bundleContainsDaemon: false, isInApplications: false), .monitoringOnly)
+        XCTAssertEqual(state(isInApplications: false, handshake: .success(ready)), .wrongLocation)
+    }
+
+    func testRegistrationStatesFollowServiceManagement() {
+        XCTAssertEqual(state(.notRegistered), .missing)
+        XCTAssertEqual(state(.requiresApproval), .approvalRequired)
+        XCTAssertEqual(state(.notFound), .monitoringOnly)
+    }
+
+    func testEnabledServiceRequiresALiveVersionCurrentHandshake() {
+        let staleRevision = Self.handshake(revision: ThermoFanXPC.implementationRevision - 1, status: 0)
+        let otherProtocol = Self.handshake(protocolVersion: ThermoFanXPC.protocolVersion + 1, status: 0)
+        let staleAndBlocked = Self.handshake(
+            revision: ThermoFanXPC.implementationRevision - 1,
+            status: ThermoFanXPC.recoveryRequiredStatus
         )
 
-        XCTAssertEqual(state(.notRegistered, handshake: nil), .missing)
-        XCTAssertEqual(state(.requiresApproval, handshake: nil), .approvalRequired)
-        XCTAssertEqual(state(.enabled, handshake: nil), .updateRequired)
-        XCTAssertEqual(state(.enabled, handshake: stale), .updateRequired)
-        XCTAssertEqual(state(.enabled, handshake: blocked), .recoveryBlocked)
-        XCTAssertEqual(state(.enabled, handshake: ready), .ready)
+        XCTAssertEqual(state(.enabled, handshake: .success(Self.handshake(status: 0))), .ready)
+        XCTAssertEqual(state(.enabled, handshake: nil), .unreachable)
+        XCTAssertEqual(state(.enabled, handshake: .success(staleRevision)), .updateRequired)
+        XCTAssertEqual(state(.enabled, handshake: .success(otherProtocol)), .updateRequired)
+        XCTAssertEqual(state(.enabled, handshake: .success(staleAndBlocked)), .updateRequired)
+    }
+
+    func testEnabledServiceMapsDaemonStatuses() {
+        XCTAssertEqual(
+            state(.enabled, handshake: .success(Self.handshake(status: ThermoFanXPC.recoveryRequiredStatus))),
+            .recoveryBlocked
+        )
+        XCTAssertEqual(
+            state(.enabled, handshake: .success(Self.handshake(status: ThermoFanXPC.notConsoleUserStatus))),
+            .inactiveSession
+        )
+        XCTAssertEqual(
+            state(.enabled, handshake: .success(Self.handshake(status: ThermoFanXPC.retiringStatus))),
+            .updateRequired
+        )
+        XCTAssertEqual(state(.enabled, handshake: .success(Self.handshake(status: 1))), .unreachable)
+    }
+
+    func testEnabledServiceWithoutAnAnswerIsUnreachable() {
+        let timeout = PrivilegedFanClient.TransportError.timeout("timed out")
+        let connection = PrivilegedFanClient.TransportError.connection("interrupted")
+
+        XCTAssertEqual(state(.enabled, handshake: .failure(timeout)), .unreachable)
+        XCTAssertEqual(state(.enabled, handshake: .failure(connection)), .unreachable)
+    }
+
+    func testLegacyHelperOnlyOverridesStatesRegistrationCanResolve() {
+        for state in Self.allStates {
+            XCTAssertEqual(FanControlService.resolvedState(state, hasLegacyHelper: false), state)
+        }
+        for state: HardwareHelperState in [.missing, .approvalRequired, .updateRequired, .ready, .unreachable] {
+            XCTAssertEqual(
+                FanControlService.resolvedState(state, hasLegacyHelper: true),
+                .legacyCleanupRequired,
+                "\(state)"
+            )
+        }
+        for state: HardwareHelperState in [.recoveryBlocked, .monitoringOnly, .wrongLocation, .inactiveSession] {
+            XCTAssertEqual(FanControlService.resolvedState(state, hasLegacyHelper: true), state, "\(state)")
+        }
     }
 
     private func state(
-        _ serviceStatus: SMAppService.Status,
-        handshake: PrivilegedFanClient.Handshake?
+        _ serviceStatus: SMAppService.Status = .enabled,
+        isDeveloperID: Bool = true,
+        bundleContainsDaemon: Bool = true,
+        isInApplications: Bool = true,
+        handshake: Swift.Result<PrivilegedFanClient.Handshake, Error>? = nil
     ) -> HardwareHelperState {
-        PrivilegedFanClient.helperState(
-            serviceStatus: serviceStatus,
-            hasDeveloperIDTeam: true,
-            isInApplications: true,
-            bundleContainsDaemon: true,
+        PrivilegedFanClient.deriveState(
+            bundleContainsDaemon: bundleContainsDaemon,
+            isRunningFromApplications: isInApplications,
+            isDeveloperID: isDeveloperID,
+            status: serviceStatus,
             handshake: handshake
+        )
+    }
+
+    private static func handshake(
+        protocolVersion: Int = ThermoFanXPC.protocolVersion,
+        revision: Int = ThermoFanXPC.implementationRevision,
+        status: Int
+    ) -> PrivilegedFanClient.Handshake {
+        PrivilegedFanClient.Handshake(
+            protocolVersion: protocolVersion,
+            implementationRevision: revision,
+            status: status,
+            message: "status \(status)"
         )
     }
 }
