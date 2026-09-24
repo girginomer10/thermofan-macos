@@ -21,12 +21,10 @@ let package = Package(
             name: "FanControlEngine",
             dependencies: ["FanSafetyPolicy"],
             path: "Helpers/ThermoFanHelper",
+            // ThermoFanEngine.c #includes main.c for historical reasons; excluding it avoids a double compile.
             exclude: ["main.c"],
             sources: ["ThermoFanEngine.c"],
             publicHeadersPath: "include",
-            cSettings: [
-                .define("THERMOFAN_ENGINE_LIBRARY")
-            ],
             linkerSettings: [
                 .linkedFramework("CoreFoundation"),
                 .linkedFramework("IOKit"),

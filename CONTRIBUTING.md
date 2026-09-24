@@ -27,9 +27,16 @@ Before opening a pull request, run:
 ```sh
 swift test
 bash -n scripts/build_app.sh
+bash -n scripts/release_direct.sh
 ./scripts/build_app.sh
 codesign --verify --deep --strict dist/ThermoFan.app
 ```
+
+Packaging identifiers and the implementation revision are read from
+`Sources/FanControlXPC/ThermoFanXPC.swift` by `scripts/packaging_contract.sh`.
+Keep those declarations on one line. `XPCContractTests` pins the XPC selectors
+and reply signatures, so changing them needs a deliberate protocol or
+implementation-revision bump.
 
 ## Pull Requests
 
@@ -42,7 +49,8 @@ Keep changes focused and explain:
 - whether hardware writes were involved;
 - how automatic-mode recovery was verified.
 
-Add tests for curve math, persistence migrations, parsers, or other deterministic
+Add XCTest cases under `Tests/ThermoFanTests` for curve math, persistence
+round-trips and migrations, parsers, the XPC contract, or other deterministic
 logic. Hardware claims must be supported by sanitized diagnostics or a clear
 manual test procedure.
 

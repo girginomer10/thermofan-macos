@@ -15,12 +15,24 @@ concurrency:
 jobs:
   build-and-test:
     name: Build and test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner || matrix.os }}
+    # Never make a leg optional: continue-on-error: true can let a failed leg
+    # pass the `required` aggregate job below.
+    continue-on-error: ${{ matrix.continue-on-error || false }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [macos-14, macos-15, macos-26]
+        include:
+          # MINIMUM-OS GATE (LSMinimumSystemVersion 14.0). GitHub retires the
+          # hosted macos-14 image on 2026-11-02. Before then, change only the
+          # `runner:` line below to the label of a self-hosted or physical
+          # macOS 14 Apple Silicon runner (see docs/DISTRIBUTION.md). Do not
+          # delete this leg and do not set continue-on-error to true.
+          - os: macos-14
+            runner: macos-14
+            continue-on-error: false
 
     steps:
       - name: Check out repository
@@ -36,36 +48,66 @@ jobs:
           printf '%s\n' "$SWIFT_VERSION"
           grep -Eq 'Swift version 6|Apple Swift version 6' <<<"$SWIFT_VERSION"
 
+      - name: Read packaging contract
+        run: |
+          source scripts/packaging_contract.sh
+          thermofan_load_packaging_contract
+          # Deliberate literal pins: renaming or bumping one of these in
+          # ThermoFanXPC.swift must also change the matching line here.
+          set -x
+          test "$THERMOFAN_APP_IDENTIFIER" = "io.github.girginomer10.ThermoFan"
+          test "$THERMOFAN_HELPER_IDENTIFIER" = "io.github.girginomer10.ThermoFan.helper"
+          test "$THERMOFAN_DAEMON_PLIST_NAME" = "io.github.girginomer10.ThermoFan.helper.plist"
+          test "$THERMOFAN_IMPLEMENTATION_REVISION" = "10"
+          test "$(thermofan_swift_constant stableRecoveryProtocolVersion)" = "9"
+
+      - name: Scan sources for legacy command surface
+        run: |
+          source scripts/packaging_contract.sh
+          thermofan_scan_sources_for_legacy_command_surface
+
       - name: Test
         run: swift test
 
       - name: Validate build script
         run: |
+          bash -n scripts/packaging_contract.sh
           bash -n scripts/build_app.sh
           bash -n scripts/release_direct.sh
-          REQ='anchor apple generic and identifier "io.github.girginomer10.ThermoFan" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ABCDE12345" and ! entitlement["com.apple.security.get-task-allow"] exists'
-          csreq -r="$REQ" -t >/dev/null
+          source scripts/packaging_contract.sh
+          thermofan_load_packaging_contract
+          for IDENTIFIER in "$THERMOFAN_APP_IDENTIFIER" "$THERMOFAN_HELPER_IDENTIFIER"; do
+            REQ="anchor apple generic and identifier \"$IDENTIFIER\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"ABCDE12345\" and ! entitlement[\"com.apple.security.get-task-allow\"] exists"
+            csreq -r="$REQ" -t >/dev/null
+          done
 
       - name: Build app bundle
         run: ./scripts/build_app.sh
 
       - name: Verify code signatures
         run: |
+          source scripts/packaging_contract.sh
+          thermofan_load_packaging_contract
           codesign --verify --strict dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper
           codesign --verify --deep --strict dist/ThermoFan.app
           HELPER_SIGNATURE="$(codesign -d --verbose=4 dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper 2>&1)"
           APP_SIGNATURE="$(codesign -d --verbose=4 dist/ThermoFan.app 2>&1)"
           grep -Eq '^CodeDirectory .* flags=.*\(.*runtime.*\)' <<<"$HELPER_SIGNATURE"
           grep -Eq '^CodeDirectory .* flags=.*\(.*runtime.*\)' <<<"$APP_SIGNATURE"
+          grep -Fqx "Identifier=$THERMOFAN_HELPER_IDENTIFIER" <<<"$HELPER_SIGNATURE"
+          grep -Fqx "Identifier=$THERMOFAN_APP_IDENTIFIER" <<<"$APP_SIGNATURE"
 
       - name: Verify bundle metadata
         run: |
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' dist/ThermoFan.app/Contents/Info.plist)" = "io.github.girginomer10.ThermoFan"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.3.0"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/ThermoFan.app/Contents/Info.plist)" = "10"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :ThermoFanGitCommit' dist/ThermoFan.app/Contents/Info.plist)" = "$(git rev-parse HEAD)"
-          grep -q '^    public static let implementationRevision = 10$' Sources/FanControlXPC/ThermoFanXPC.swift
-          grep -q '^    public static let stableRecoveryProtocolVersion = 9$' Sources/FanControlXPC/ThermoFanXPC.swift
+          source scripts/packaging_contract.sh
+          thermofan_load_packaging_contract
+          INFO_PLIST=dist/ThermoFan.app/Contents/Info.plist
+          DAEMON_PLIST="dist/ThermoFan.app/Contents/Library/LaunchDaemons/$THERMOFAN_DAEMON_PLIST_NAME"
+          plutil -lint "$INFO_PLIST" "$DAEMON_PLIST"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")" = "$THERMOFAN_APP_IDENTIFIER"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")" = "0.3.0"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST")" = "$THERMOFAN_IMPLEMENTATION_REVISION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ThermoFanGitCommit' "$INFO_PLIST")" = "$(git rev-parse HEAD)"
           grep -q '^    func recoveryHandshake($' Sources/FanControlXPC/ThermoFanXPC.swift
           grep -q '^    func prepareForServiceRemoval($' Sources/FanControlXPC/ThermoFanXPC.swift
           grep -q '^#define THERMOFAN_ENGINE_PROTOCOL_VERSION 9$' Helpers/ThermoFanHelper/include/ThermoFanEngine.h
@@ -79,18 +121,17 @@ jobs:
           test "$(awk '$1 == "minos" { print $2; exit }' <<<"$HELPER_BUILD_INFO")" = "14.0"
           test ! -e dist/ThermoFan.app/Contents/Library/PrivilegedHelperTools
           test "$(stat -f '%Lp' dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper)" = "755"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :Label' dist/ThermoFan.app/Contents/Library/LaunchDaemons/io.github.girginomer10.ThermoFan.helper.plist)" = "io.github.girginomer10.ThermoFan.helper"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :BundleProgram' dist/ThermoFan.app/Contents/Library/LaunchDaemons/io.github.girginomer10.ThermoFan.helper.plist)" = "Contents/MacOS/ThermoFanHelper"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :MachServices:io.github.girginomer10.ThermoFan.helper' dist/ThermoFan.app/Contents/Library/LaunchDaemons/io.github.girginomer10.ThermoFan.helper.plist)" = "true"
-          for COMMAND_SURFACE_PATH in \
-            dist/ThermoFan.app/Contents/MacOS/ThermoFan \
-            dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper; do
-            COMMAND_SURFACE_STRINGS="$(strings "$COMMAND_SURFACE_PATH")"
-            if grep -Eq -- '--fanctl|--watch|THERMOFAN_WATCHDOG_READY|osascript' <<<"$COMMAND_SURFACE_STRINGS"; then
-              echo "A legacy CLI/setuid command surface was found in $COMMAND_SURFACE_PATH." >&2
-              exit 1
-            fi
-          done
+          test "$(/usr/libexec/PlistBuddy -c 'Print :Label' "$DAEMON_PLIST")" = "$THERMOFAN_HELPER_IDENTIFIER"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$DAEMON_PLIST")" = "Contents/MacOS/ThermoFanHelper"
+          test "$(/usr/libexec/PlistBuddy -c "Print :MachServices:$THERMOFAN_HELPER_IDENTIFIER" "$DAEMON_PLIST")" = "true"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :AssociatedBundleIdentifiers:0' "$DAEMON_PLIST")" = "$THERMOFAN_APP_IDENTIFIER"
+
+      - name: Scan binaries for legacy command surface
+        run: |
+          source scripts/packaging_contract.sh
+          thermofan_scan_binary_for_legacy_command_surface dist/ThermoFan.app/Contents/MacOS/ThermoFan
+          thermofan_scan_binary_for_legacy_command_surface dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper
+          thermofan_require_helper_without_force_mask dist/ThermoFan.app/Contents/MacOS/ThermoFanHelper
 
   required:
     name: Build and test
@@ -99,6 +140,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
+      # Branch protection requires only this check. It passes only when every
+      # matrix leg, including the macOS 14 minimum-OS gate, succeeded; a leg
+      # that fails, is cancelled, or cannot get a runner keeps it from passing.
       - name: Require every macOS matrix job
         env:
           MATRIX_RESULT: ${{ needs.build-and-test.result }}

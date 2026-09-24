@@ -35,6 +35,8 @@ migration.
    mutual XPC requirements pass.
 6. Relevant physical M-series rows in `COMPATIBILITY.md` pass, including Auto,
    manual read-back, physical RPM response, recovery, sleep/wake, and force-quit.
+7. The released commit is the verified `origin/main` head and has a completed,
+   successful CI push run (enforced by `release_direct.sh`).
 
 Notarization checks signing and malicious content. It does not certify private
 SMC behavior or prove compatibility with a Mac model.
@@ -52,6 +54,12 @@ The plist uses `BundleProgram=Contents/MacOS/ThermoFanHelper`, advertises the
 `io.github.girginomer10.ThermoFan.helper` Mach service, and is registered with
 `SMAppService.daemon(plistName:)`. It is not copied to
 `/Library/PrivilegedHelperTools`.
+
+The app identifier, helper identifier, and plist name are defined once, as
+`appIdentifier`, `helperIdentifier`, and `daemonPlistName` in
+`Sources/FanControlXPC/ThermoFanXPC.swift`. `scripts/packaging_contract.sh`
+reads them from there for `build_app.sh`, `release_direct.sh`, and CI, and
+stops with exit status 64 if any of them is missing or malformed.
 
 ## Mutual Developer ID Requirements
 
@@ -109,11 +117,14 @@ codesign --verify --deep --strict dist/ThermoFan.app
 ```
 
 Version, build number, and signing identity can be supplied without editing the
-repository:
+repository. The build number defaults to `ThermoFanXPC.implementationRevision`
+(currently 10) and must equal it, so a launchd payload change cannot ship
+without forcing a helper update. Any other value stops the build with exit
+status 64:
 
 ```sh
 THERMOFAN_VERSION=0.3.0 \
-THERMOFAN_BUILD_NUMBER=9 \
+THERMOFAN_BUILD_NUMBER=10 \
 THERMOFAN_SIGNING_IDENTITY="Developer ID Application: Example (TEAMID)" \
 ./scripts/build_app.sh
 ```
@@ -138,23 +149,24 @@ Apple references:
 ## Release Candidate Script
 
 `scripts/release_direct.sh` requires an available Developer ID Application
-identity and Keychain notarization profile. It verifies the embedded
-LaunchDaemon layout, forbids setuid bits and the old CLI surface, checks both
-exact code requirements, requires a clean `main` checkout matching
-`origin/main`, runs the full tests, embeds that Git SHA, creates and signs the
-DMG, requires notarization `Accepted` with zero logged issues, staples and
-re-verifies the artifact, mounts the finished DMG read-only and rechecks its app
-and helper payload, runs Gatekeeper checks, and writes a SHA-256 checksum plus
-release-evidence plist. Rejected submissions preserve their submission and log
-JSON under the ignored `dist/notary-failures` directory for diagnosis. CI runs
-the same build/test/package checks on arm64 macOS 14, macOS 15, and macOS 26
-runners.
+identity and Keychain notarization profile. Before building, it requires a
+clean `main` checkout that matches `origin/main`. It also requires a completed,
+successful push run of the `CI` workflow for that exact commit, checked with
+`gh run list --commit <sha> --workflow CI --event push`. If `gh` is missing,
+the query fails, or no such run exists, it exits with status 78.
+`THERMOFAN_SKIP_CI_CHECK=1` bypasses only this CI check: the script prints a
+loud warning and the release evidence records `CIVerification` as skipped.
 
-GitHub's hosted arm64 `macos-14` image is scheduled to retire on 2 November
-2026. Before that date, preserve the minimum-OS gate on a physical or
-self-hosted macOS 14 Apple Silicon runner; do not silently replace it with a
-newer-OS-only build check. See GitHub's
-[runner announcement](https://github.com/actions/runner-images/issues/13518).
+The script then scans `Sources/` and `Helpers/` for the legacy command surface,
+runs the full tests, and embeds that Git SHA. It verifies the embedded
+LaunchDaemon layout. It forbids setuid bits, the old CLI surface in both
+executables, and the `FS!` key string in the arm64 helper. It checks both exact
+code requirements and creates and signs the DMG. Notarization must return
+`Accepted` with zero logged issues. The script staples and re-verifies the
+artifact, mounts the finished DMG read-only to recheck its app and helper
+payload, and runs Gatekeeper checks. Finally, it writes a SHA-256 checksum and
+a release-evidence plist. Rejected submissions keep their submission and log
+JSON under the ignored `dist/notary-failures` directory for diagnosis.
 
 ```sh
 THERMOFAN_SIGNING_IDENTITY="Developer ID Application: Example (TEAMID)" \
@@ -162,5 +174,64 @@ THERMOFAN_NOTARY_PROFILE=thermofan-notary \
 ./scripts/release_direct.sh
 ```
 
+## What CI Verifies
+
+CI (`.github/workflows/ci.yml`) runs on GitHub-hosted arm64 macOS 14, macOS 15,
+and macOS 26 runners and only ever uses an ad-hoc signature. On each runner it:
+
+- runs `swift test`, including the `XPCContractTests` wire-contract pins;
+- checks the identifiers and implementation revision against literal values;
+- scans the sources for the legacy command surface;
+- builds the bundle with `scripts/build_app.sh`;
+- checks the result's structure: ad-hoc signature validity, the Hardened
+  Runtime flag, signing identifiers, Info.plist and LaunchDaemon plist
+  contents, arm64-only executables, the macOS 14 deployment target, file
+  modes, and banned strings in both executables, including `FS!` in the helper.
+
+CI cannot run Developer ID signing, designated-requirement verification
+(`codesign -R` against a real Team ID; CI only syntax-checks the requirement
+strings with `csreq`), notarization, stapling, or Gatekeeper (`spctl`)
+assessment. It has no Developer ID identity, Team ID, or notary credentials.
+Those checks run only in `scripts/release_direct.sh` on a machine that has the
+credentials. A green CI run is required for a release, but it is not enough on
+its own.
+
+### macOS 14 Runner Retirement
+
+GitHub's hosted arm64 `macos-14` image is scheduled to retire on 2 November
+2026 (see GitHub's
+[runner announcement](https://github.com/actions/runner-images/issues/13518)).
+The macOS 14 leg is the minimum-OS gate. Before that date, move it to a
+self-hosted or physical macOS 14 Apple Silicon runner. Do not delete the leg or
+replace it with a check on a newer OS only. Do not set
+`continue-on-error: true` either, because a failed leg could then pass the
+aggregate `Build and test` check.
+
+The line to change is `runner:` in the `include` entry for `os: macos-14` in
+`.github/workflows/ci.yml`:
+
+```yaml
+            runner: macos-14
+```
+
+Change it to the custom label you assign to the self-hosted runner, for
+example:
+
+```yaml
+            runner: thermofan-macos-14-arm64
+```
+
+Keep `os: macos-14` so the job name and the Xcode selection step stay the
+same. The runner needs Xcode 16.2 at `/Applications/Xcode_16.2.app` and
+passwordless `sudo xcode-select`; otherwise, adjust that step. This is a public
+repository, so set fork pull request workflows to require approval for all
+outside contributors (**Settings > Actions > General**) and review each run
+before approving it. Unreviewed code must never run on the self-hosted machine.
+
+## Secrets
+
 Never commit `.p12`, `.p8`, passwords, private keys, App Store Connect keys, or
-notarization credentials.
+notarization credentials. As a safety net, `.gitignore` excludes `*.p12`,
+`*.p8`, `*.mobileprovision`, `*.notary-profile`, `.env`, and `.env.*`. That
+does not make it safe to store secrets in the checkout, so keep them in
+Keychain or outside the repository.

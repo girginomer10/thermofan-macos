@@ -2,20 +2,27 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Identifiers and the implementation revision come from ThermoFanXPC.swift so
+# the bundle, launchd plist, and code signatures match what the app and daemon
+# require at runtime. Exits 64 if any of them cannot be read.
+# shellcheck source=scripts/packaging_contract.sh
+source "$ROOT_DIR/scripts/packaging_contract.sh"
+thermofan_load_packaging_contract
 APP_NAME="ThermoFan"
+APP_IDENTIFIER="$THERMOFAN_APP_IDENTIFIER"
+HELPER_IDENTIFIER="$THERMOFAN_HELPER_IDENTIFIER"
+DAEMON_PLIST_NAME="$THERMOFAN_DAEMON_PLIST_NAME"
+IMPLEMENTATION_REVISION="$THERMOFAN_IMPLEMENTATION_REVISION"
 BUNDLE_DIR="$ROOT_DIR/dist/$APP_NAME.app"
 HELPER_BIN="$BUNDLE_DIR/Contents/MacOS/ThermoFanHelper"
-DAEMON_LABEL="io.github.girginomer10.ThermoFan.helper"
-DAEMON_PLIST_NAME="$DAEMON_LABEL.plist"
 DAEMON_PLIST="$BUNDLE_DIR/Contents/Library/LaunchDaemons/$DAEMON_PLIST_NAME"
 ICON_SOURCE="$ROOT_DIR/Resources/AppIcon.png"
 ICONSET_DIR="$ROOT_DIR/.build/ThermoFan.iconset"
 APP_VERSION="${THERMOFAN_VERSION:-0.3.0}"
-BUILD_NUMBER="${THERMOFAN_BUILD_NUMBER:-10}"
+BUILD_NUMBER="${THERMOFAN_BUILD_NUMBER:-$IMPLEMENTATION_REVISION}"
 GIT_COMMIT="${THERMOFAN_GIT_COMMIT:-$(git -C "$ROOT_DIR" rev-parse HEAD)}"
 SIGNING_IDENTITY="${THERMOFAN_SIGNING_IDENTITY:--}"
 MINIMUM_SYSTEM_VERSION="14.0"
-IMPLEMENTATION_REVISION="$(sed -nE 's/^[[:space:]]*public static let implementationRevision = ([0-9]+)$/\1/p' "$ROOT_DIR/Sources/FanControlXPC/ThermoFanXPC.swift")"
 
 if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "THERMOFAN_VERSION must use numeric major.minor.patch format." >&2
@@ -29,8 +36,8 @@ if [[ ! "$GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   echo "THERMOFAN_GIT_COMMIT must be a full lowercase Git SHA." >&2
   exit 64
 fi
-if [[ -z "$IMPLEMENTATION_REVISION" || "$BUILD_NUMBER" != "$IMPLEMENTATION_REVISION" ]]; then
-  echo "THERMOFAN_BUILD_NUMBER must equal the Hardware Helper implementation revision ($IMPLEMENTATION_REVISION)." >&2
+if [[ "$BUILD_NUMBER" != "$IMPLEMENTATION_REVISION" ]]; then
+  echo "THERMOFAN_BUILD_NUMBER must equal ThermoFanXPC.implementationRevision ($IMPLEMENTATION_REVISION)." >&2
   exit 64
 fi
 
@@ -85,7 +92,7 @@ cat > "$BUNDLE_DIR/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key>
   <string>ThermoFan</string>
   <key>CFBundleIdentifier</key>
-  <string>io.github.girginomer10.ThermoFan</string>
+  <string>$APP_IDENTIFIER</string>
   <key>CFBundleIconFile</key>
   <string>ThermoFan</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -122,19 +129,19 @@ cat > "$DAEMON_PLIST" <<PLIST
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>$DAEMON_LABEL</string>
+  <string>$HELPER_IDENTIFIER</string>
   <key>BundleProgram</key>
   <string>Contents/MacOS/ThermoFanHelper</string>
   <key>MachServices</key>
   <dict>
-    <key>$DAEMON_LABEL</key>
+    <key>$HELPER_IDENTIFIER</key>
     <true/>
   </dict>
   <key>KeepAlive</key>
   <true/>
   <key>AssociatedBundleIdentifiers</key>
   <array>
-    <string>io.github.girginomer10.ThermoFan</string>
+    <string>$APP_IDENTIFIER</string>
   </array>
 </dict>
 </plist>
@@ -142,9 +149,9 @@ PLIST
 
 printf 'APPL????' > "$BUNDLE_DIR/Contents/PkgInfo"
 plutil -lint "$BUNDLE_DIR/Contents/Info.plist" "$DAEMON_PLIST" >/dev/null
-if [[ "$(plutil -extract Label raw "$DAEMON_PLIST")" != "$DAEMON_LABEL" \
+if [[ "$(plutil -extract Label raw "$DAEMON_PLIST")" != "$HELPER_IDENTIFIER" \
    || "$(plutil -extract BundleProgram raw "$DAEMON_PLIST")" != "Contents/MacOS/ThermoFanHelper" \
-   || "$(/usr/libexec/PlistBuddy -c "Print :MachServices:$DAEMON_LABEL" "$DAEMON_PLIST")" != "true" ]]; then
+   || "$(/usr/libexec/PlistBuddy -c "Print :MachServices:$HELPER_IDENTIFIER" "$DAEMON_PLIST")" != "true" ]]; then
   echo "LaunchDaemon plist identity or BundleProgram is invalid." >&2
   exit 1
 fi
@@ -152,8 +159,8 @@ if [[ "$(stat -f '%Lp' "$HELPER_BIN")" != "755" ]]; then
   echo "ThermoFanHelper must be mode 0755 with no setuid/setgid bits." >&2
   exit 1
 fi
-codesign "${SIGNING_ARGUMENTS[@]}" --identifier "$DAEMON_LABEL" "$HELPER_BIN" >/dev/null
-codesign "${SIGNING_ARGUMENTS[@]}" --identifier io.github.girginomer10.ThermoFan "$BUNDLE_DIR" >/dev/null
+codesign "${SIGNING_ARGUMENTS[@]}" --identifier "$HELPER_IDENTIFIER" "$HELPER_BIN" >/dev/null
+codesign "${SIGNING_ARGUMENTS[@]}" --identifier "$APP_IDENTIFIER" "$BUNDLE_DIR" >/dev/null
 
 for executable_path in "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" "$HELPER_BIN"; do
   if [[ "$(lipo -archs "$executable_path")" != "arm64" ]]; then

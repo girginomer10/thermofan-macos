@@ -70,9 +70,19 @@ Requirements:
 git clone https://github.com/girginomer10/thermofan-macos.git
 cd thermofan-macos
 ./scripts/build_app.sh
+rm -rf /Applications/ThermoFan.app
 ditto dist/ThermoFan.app /Applications/ThermoFan.app
 open /Applications/ThermoFan.app
 ```
+
+Quit ThermoFan before installing. Remove the old copy first because `ditto`
+merges into an existing bundle instead of replacing it. Leftover files from the
+old version would sit inside the newly signed bundle and break its code
+signature, so `codesign --verify --deep --strict` fails and macOS can refuse to
+launch the app or its helper. If a Developer ID build with a registered
+Hardware Helper is installed, choose **Unregister** in that build before you
+replace it (see [Uninstall](#uninstall)). An ad-hoc source build cannot run
+the authenticated removal.
 
 The build script creates an arm64, Hardened Runtime app bundle with an ad-hoc
 development signature at `dist/ThermoFan.app`. Ad-hoc builds deliberately stay

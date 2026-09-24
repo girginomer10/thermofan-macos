@@ -2,18 +2,25 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Identifiers and the implementation revision come from ThermoFanXPC.swift,
+# exactly as in build_app.sh and CI. Exits 64 if any of them cannot be read.
+# shellcheck source=scripts/packaging_contract.sh
+source "$ROOT_DIR/scripts/packaging_contract.sh"
+thermofan_load_packaging_contract
 APP_NAME="ThermoFan"
 APP_PATH="$ROOT_DIR/dist/$APP_NAME.app"
 SIGNING_IDENTITY="${THERMOFAN_SIGNING_IDENTITY:-}"
 NOTARY_PROFILE="${THERMOFAN_NOTARY_PROFILE:-}"
 APP_VERSION="${THERMOFAN_VERSION:-0.3.0}"
-BUILD_NUMBER="${THERMOFAN_BUILD_NUMBER:-10}"
-APP_IDENTIFIER="io.github.girginomer10.ThermoFan"
-HELPER_IDENTIFIER="$APP_IDENTIFIER.helper"
-DAEMON_PLIST="$APP_PATH/Contents/Library/LaunchDaemons/$HELPER_IDENTIFIER.plist"
+BUILD_NUMBER="${THERMOFAN_BUILD_NUMBER:-$THERMOFAN_IMPLEMENTATION_REVISION}"
+APP_IDENTIFIER="$THERMOFAN_APP_IDENTIFIER"
+HELPER_IDENTIFIER="$THERMOFAN_HELPER_IDENTIFIER"
+DAEMON_PLIST_NAME="$THERMOFAN_DAEMON_PLIST_NAME"
+DAEMON_PLIST="$APP_PATH/Contents/Library/LaunchDaemons/$DAEMON_PLIST_NAME"
 APP_BINARY="$APP_PATH/Contents/MacOS/ThermoFan"
 HELPER_PATH="$APP_PATH/Contents/MacOS/ThermoFanHelper"
 GIT_SHA="$(git -C "$ROOT_DIR" rev-parse HEAD)"
+CI_VERIFICATION="unverified"
 
 verify_release_checkout() {
   if [[ "$(git -C "$ROOT_DIR" branch --show-current)" != "main" ]]; then
@@ -28,6 +35,46 @@ verify_release_checkout() {
     echo "Direct releases require a completely clean checkout." >&2
     exit 65
   fi
+}
+
+# Requires a completed, successful run of the CI workflow for this exact
+# commit. Only push runs count: a pull_request run tests a merge ref, not
+# the commit being released.
+verify_ci_passed_for_release_commit() {
+  local successful_runs
+  if [[ "${THERMOFAN_SKIP_CI_CHECK:-}" == "1" ]]; then
+    CI_VERIFICATION="skipped (THERMOFAN_SKIP_CI_CHECK=1)"
+    {
+      echo "################################################################"
+      echo "WARNING: THERMOFAN_SKIP_CI_CHECK=1 is set."
+      echo "WARNING: Releasing $GIT_SHA WITHOUT confirming that the CI"
+      echo "WARNING: workflow passed for this exact commit. The release"
+      echo "WARNING: evidence will record that CI was not verified."
+      echo "################################################################"
+    } >&2
+    return 0
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "The GitHub CLI (gh) is required to confirm that CI passed for $GIT_SHA." >&2
+    echo "Install and authenticate gh, or set THERMOFAN_SKIP_CI_CHECK=1 to bypass (not recommended)." >&2
+    exit 78
+  fi
+  if ! successful_runs="$(cd "$ROOT_DIR" && gh run list \
+      --commit "$GIT_SHA" \
+      --workflow CI \
+      --event push \
+      --json conclusion,status \
+      --jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length')"; then
+    echo "Could not query GitHub Actions for CI runs of $GIT_SHA; check 'gh auth status'." >&2
+    exit 78
+  fi
+  if [[ ! "$successful_runs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "No completed, successful CI workflow run exists for $GIT_SHA." >&2
+    echo "Wait for CI on main to finish (or re-run it) and release only after it passes." >&2
+    exit 78
+  fi
+  CI_VERIFICATION="passed"
+  echo "CI passed for $GIT_SHA."
 }
 
 verify_release_checkout
@@ -50,6 +97,9 @@ if ! grep -Fq "\"$SIGNING_IDENTITY\"" <<<"$AVAILABLE_IDENTITIES"; then
   echo "The requested Developer ID signing identity is not available in Keychain." >&2
   exit 69
 fi
+
+verify_ci_passed_for_release_commit
+thermofan_scan_sources_for_legacy_command_surface || exit 1
 
 cd "$ROOT_DIR"
 swift test
@@ -84,12 +134,9 @@ if [[ "$(plutil -extract ThermoFanGitCommit raw "$APP_PATH/Contents/Info.plist")
   exit 1
 fi
 for command_surface_path in "$APP_BINARY" "$HELPER_PATH"; do
-  COMMAND_SURFACE_STRINGS="$(strings "$command_surface_path")"
-  if grep -Eq -- '--fanctl|--watch|THERMOFAN_WATCHDOG_READY|osascript' <<<"$COMMAND_SURFACE_STRINGS"; then
-    echo "A legacy CLI/setuid command surface was found in $command_surface_path." >&2
-    exit 1
-  fi
+  thermofan_scan_binary_for_legacy_command_surface "$command_surface_path" || exit 1
 done
+thermofan_require_helper_without_force_mask "$HELPER_PATH" || exit 1
 
 APP_SIGNATURE_DETAILS="$(codesign -d --verbose=4 "$APP_PATH" 2>&1)"
 TEAM_ID="$(awk -F= '$1 == "TeamIdentifier" { print $2; exit }' <<<"$APP_SIGNATURE_DETAILS")"
@@ -254,6 +301,7 @@ plutil -create xml1 "$EVIDENCE_PATH"
 plutil -insert Version -string "$APP_VERSION" "$EVIDENCE_PATH"
 plutil -insert BuildNumber -string "$BUILD_NUMBER" "$EVIDENCE_PATH"
 plutil -insert GitCommit -string "$GIT_SHA" "$EVIDENCE_PATH"
+plutil -insert CIVerification -string "$CI_VERIFICATION" "$EVIDENCE_PATH"
 plutil -insert NotarySubmissionID -string "$NOTARY_ID" "$EVIDENCE_PATH"
 plutil -insert NotaryStatus -string "$NOTARY_STATUS" "$EVIDENCE_PATH"
 plutil -insert NotaryIssueCount -integer "$NOTARY_ISSUE_COUNT" "$EVIDENCE_PATH"
