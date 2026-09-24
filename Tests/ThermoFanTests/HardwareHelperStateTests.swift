@@ -45,7 +45,7 @@ final class HardwareHelperStateTests: XCTestCase {
     func testStableProtocolNineRemovalSelectorCannotDisappear() {
         XCTAssertEqual(ThermoFanXPC.protocolVersion, 9)
         XCTAssertEqual(ThermoFanXPC.stableRecoveryProtocolVersion, 9)
-        XCTAssertEqual(ThermoFanXPC.implementationRevision, 9)
+        XCTAssertEqual(ThermoFanXPC.implementationRevision, 10)
 
         let selector = NSSelectorFromString("prepareForServiceRemovalWithReply:")
         let description = protocol_getMethodDescription(

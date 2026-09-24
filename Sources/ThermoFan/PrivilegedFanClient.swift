@@ -78,6 +78,10 @@ final class PrivilegedFanClient: @unchecked Sendable {
     private var revision: UInt64 = 0
     private var heartbeatTimer: DispatchSourceTimer?
 
+    /// Called off the main actor with the fan indexes whose lease ended
+    /// without an app-initiated Auto, plus a human-readable reason.
+    var onLeaseLost: (@Sendable (Set<Int>, String) -> Void)?
+
     deinit {
         invalidateTransport()
     }
@@ -349,6 +353,23 @@ final class PrivilegedFanClient: @unchecked Sendable {
                 return .recoveryRequired("The authenticated Hardware Helper connection failed; automatic recovery was requested: \(error.localizedDescription)")
             }
             return .failed("Hardware Helper connection failed before a watchdog lease was armed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Retries the daemon's verified automatic recovery without touching
+    /// service registration. Safe in `.recoveryBlocked`.
+    func retryAutomaticRecovery() -> Result {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        do {
+            let response = try sendRecoveryRetry()
+            if response.status == 0 {
+                clearArmedState()
+            }
+            return classify(response)
+        } catch {
+            invalidateTransport()
+            return .recoveryRequired("The automatic recovery retry result became uncertain; the connection was closed and the daemon recovery supervisor remains authoritative: \(error.localizedDescription)")
         }
     }
 

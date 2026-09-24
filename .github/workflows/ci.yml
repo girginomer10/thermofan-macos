@@ -62,9 +62,9 @@ jobs:
         run: |
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' dist/ThermoFan.app/Contents/Info.plist)" = "io.github.girginomer10.ThermoFan"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ThermoFan.app/Contents/Info.plist)" = "0.3.0"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/ThermoFan.app/Contents/Info.plist)" = "9"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/ThermoFan.app/Contents/Info.plist)" = "10"
           test "$(/usr/libexec/PlistBuddy -c 'Print :ThermoFanGitCommit' dist/ThermoFan.app/Contents/Info.plist)" = "$(git rev-parse HEAD)"
-          grep -q '^    public static let implementationRevision = 9$' Sources/FanControlXPC/ThermoFanXPC.swift
+          grep -q '^    public static let implementationRevision = 10$' Sources/FanControlXPC/ThermoFanXPC.swift
           grep -q '^    public static let stableRecoveryProtocolVersion = 9$' Sources/FanControlXPC/ThermoFanXPC.swift
           grep -q '^    func recoveryHandshake($' Sources/FanControlXPC/ThermoFanXPC.swift
           grep -q '^    func prepareForServiceRemoval($' Sources/FanControlXPC/ThermoFanXPC.swift

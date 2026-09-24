@@ -424,6 +424,10 @@ struct HelperStatusRow: View {
         case .updateRequired: "Hardware Helper update required"
         case .recoveryBlocked: "Hardware recovery requires attention"
         case .ready: "Hardware Helper ready"
+        case .monitoringOnly: "Monitoring only"
+        case .wrongLocation: "Move ThermoFan to Applications"
+        case .inactiveSession: "Inactive login session"
+        case .unreachable: "Hardware Helper not responding"
         }
     }
 
@@ -435,6 +439,10 @@ struct HelperStatusRow: View {
         case .updateRequired: "Install the notarized app in Applications and re-register its authenticated service."
         case .recoveryBlocked: "Manual writes stay disabled until automatic hardware control is verified."
         case .ready: "Authenticated fan writes, curve tracking, heartbeat, and crash recovery are available."
+        case .monitoringOnly: "This build is not Developer ID signed or lacks the embedded helper, so it can only monitor."
+        case .wrongLocation: "Move ThermoFan.app to /Applications and relaunch it to enable the authenticated helper."
+        case .inactiveSession: "Privileged control is available only to the active console user session."
+        case .unreachable: "The registered helper did not answer in time. It may be recovering; retry shortly."
         }
     }
 
@@ -446,6 +454,10 @@ struct HelperStatusRow: View {
         case .updateRequired: "exclamationmark.shield.fill"
         case .recoveryBlocked: "exclamationmark.triangle.fill"
         case .ready: "checkmark.shield.fill"
+        case .monitoringOnly: "eye"
+        case .wrongLocation: "folder.badge.questionmark"
+        case .inactiveSession: "person.crop.circle.badge.xmark"
+        case .unreachable: "clock.badge.exclamationmark"
         }
     }
 
@@ -457,6 +469,10 @@ struct HelperStatusRow: View {
         case .updateRequired: "Update"
         case .recoveryBlocked: "Retry Recovery"
         case .ready: "Ready"
+        case .monitoringOnly: "Monitoring only"
+        case .wrongLocation: "Move to Applications"
+        case .inactiveSession: "Unavailable"
+        case .unreachable: "Retry"
         }
     }
 
@@ -1053,6 +1069,10 @@ struct CompactFanCard: View {
         case .updateRequired: "Update & Apply"
         case .recoveryBlocked: "Retry Recovery"
         case .ready: fan.controlState == .failed ? "Retry" : "Apply"
+        case .monitoringOnly: "Monitoring only"
+        case .wrongLocation: "Move to Applications"
+        case .inactiveSession: "Unavailable"
+        case .unreachable: "Retry"
         }
     }
 
@@ -1251,6 +1271,10 @@ struct FullFanCard: View {
         case .updateRequired: "Update Helper & Apply"
         case .recoveryBlocked: "Retry Automatic Recovery"
         case .ready: fan.controlState == .failed ? "Retry Hardware Write" : "Apply to Hardware"
+        case .monitoringOnly: "Monitoring only"
+        case .wrongLocation: "Move to Applications"
+        case .inactiveSession: "Unavailable in this session"
+        case .unreachable: "Retry Helper"
         }
     }
 

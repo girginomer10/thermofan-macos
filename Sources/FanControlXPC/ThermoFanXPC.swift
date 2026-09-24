@@ -59,10 +59,17 @@ public enum ThermoFanXPC {
     /// re-registration before the new helper can write.
     /// The direct-release build number is intentionally tied to this value so
     /// launchd payload changes cannot be shipped without forcing an update.
-    public static let implementationRevision = 9
+    public static let implementationRevision = 10
     public static let stableRecoveryProtocolVersion = 9
     public static let recoveryRequiredStatus = 75
     public static let leaseLostStatus = 76
+    /// The daemon answered, but the caller is not the active local
+    /// graphical console user, so privileged control is unavailable to
+    /// this login session. Monitoring keeps working.
+    public static let notConsoleUserStatus = 77
+    /// The daemon verified Auto for `prepareForServiceRemoval` and is
+    /// waiting to be unregistered; writes are refused until then.
+    public static let retiringStatus = 78
     public static let appIdentifier = "io.github.girginomer10.ThermoFan"
     public static let helperIdentifier = "io.github.girginomer10.ThermoFan.helper"
     public static let daemonPlistName = "io.github.girginomer10.ThermoFan.helper.plist"

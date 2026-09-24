@@ -141,9 +141,24 @@ enum HardwareHelperState: Hashable {
     case missing
     case legacyCleanupRequired
     case approvalRequired
+    /// The registered daemon's protocol or implementation revision does not
+    /// match this app (or it is retiring after a verified Auto), so the
+    /// service must be updated through the stable recovery boundary.
     case updateRequired
     case recoveryBlocked
     case ready
+    /// This build cannot use privileged control at all: it is ad-hoc or not
+    /// Developer ID signed, or the embedded daemon payload is missing.
+    case monitoringOnly
+    /// The app is signed correctly but is not running from
+    /// `/Applications/ThermoFan.app`, which `SMAppService` requires.
+    case wrongLocation
+    /// The daemon is registered and current, but this login session is not
+    /// the active local graphical console user.
+    case inactiveSession
+    /// The daemon is registered but did not answer the handshake in time
+    /// (busy with recovery, legacy cleanup, or a hung transport).
+    case unreachable
 
     var title: String {
         switch self {
@@ -153,6 +168,22 @@ enum HardwareHelperState: Hashable {
         case .updateRequired: "Update required"
         case .recoveryBlocked: "Recovery blocked"
         case .ready: "Ready"
+        case .monitoringOnly: "Monitoring only"
+        case .wrongLocation: "Move to Applications"
+        case .inactiveSession: "Inactive login session"
+        case .unreachable: "Helper not responding"
+        }
+    }
+
+    /// States where pressing the helper action can register, update, or
+    /// approve the service. The remaining states are informational.
+    var isActionable: Bool {
+        switch self {
+        case .missing, .legacyCleanupRequired, .approvalRequired, .updateRequired,
+             .recoveryBlocked, .unreachable:
+            true
+        case .ready, .monitoringOnly, .wrongLocation, .inactiveSession:
+            false
         }
     }
 

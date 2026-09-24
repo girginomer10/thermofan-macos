@@ -35,16 +35,64 @@ final class FanControlService: @unchecked Sendable {
         "/Library/PrivilegedHelperTools/local.codex.ThermoFan.helper.version"
     ]
 
+    private let cacheLock = NSLock()
+    private var cachedState: HardwareHelperState = .missing
+
+    /// Invoked off the main actor whenever the privileged lease for the given
+    /// fan IDs (`fan{i}`) ends without the app asking for it: heartbeat
+    /// expiry, XPC interruption, daemon restart, console-user change, or a
+    /// lease-lost status from the daemon. The store must reconcile its UI.
+    var onLeaseLost: (@Sendable ([String], String) -> Void)? {
+        didSet {
+            guard let handler = onLeaseLost else {
+                client.onLeaseLost = nil
+                return
+            }
+            let bridged: @Sendable (Set<Int>, String) -> Void = { indexes, reason in
+                let identifiers = indexes.sorted().map { "fan\($0)" }
+                handler(identifiers, reason)
+            }
+            client.onLeaseLost = bridged
+        }
+    }
+
     init(client: PrivilegedFanClient = PrivilegedFanClient()) {
         self.client = client
     }
 
+    /// Blocking: performs the code-signature, `SMAppService`, and handshake
+    /// checks. Call only from the control queue, never from the main actor.
     var persistentHelperState: HardwareHelperState {
         let state = client.serviceState
+        let resolved: HardwareHelperState
         if hasLegacyPrivilegedHelper, state != .recoveryBlocked {
-            return .legacyCleanupRequired
+            resolved = .legacyCleanupRequired
+        } else {
+            resolved = state
         }
-        return state
+        cacheLock.lock()
+        cachedState = resolved
+        cacheLock.unlock()
+        return resolved
+    }
+
+    /// Blocking refresh that also updates `cachedHelperState`.
+    func refreshHelperState() -> HardwareHelperState {
+        persistentHelperState
+    }
+
+    /// Non-blocking snapshot of the last computed helper state. Safe to read
+    /// from the main actor on every refresh tick.
+    var cachedHelperState: HardwareHelperState {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cachedState
+    }
+
+    /// Asks the daemon to retry verified automatic recovery. This never
+    /// unregisters, re-registers, or writes a manual target.
+    func retryAutomaticRecovery() -> ApplyResult {
+        map(client.retryAutomaticRecovery())
     }
 
     var isPersistentHelperInstalled: Bool {
