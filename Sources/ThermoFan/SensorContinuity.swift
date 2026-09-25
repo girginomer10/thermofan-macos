@@ -45,13 +45,27 @@ enum SensorContinuity {
         return result
     }
 
+    /// Whether the reading was updated recently enough to be shown as current.
+    /// Every source, including `.estimated`, is judged by its timestamp; an
+    /// estimated reading is never a measurement, so callers that drive fan
+    /// control must additionally exclude `.estimated` sensors themselves.
     static func isFresh(
         _ sensor: ThermalSensor,
         now: Date = Date(),
         refreshInterval: TimeInterval
     ) -> Bool {
-        guard sensor.source != .estimated else { return true }
         let freshnessWindow = max(6, refreshInterval * 3)
         return now.timeIntervalSince(sensor.updatedAt) <= freshnessWindow
+    }
+
+    /// Whether a reading may drive a fan write: it must be a fresh, real
+    /// measurement (or an index built from them), never an estimate.
+    static func isUsableForControl(
+        _ sensor: ThermalSensor,
+        now: Date = Date(),
+        refreshInterval: TimeInterval
+    ) -> Bool {
+        sensor.source != .estimated
+            && isFresh(sensor, now: now, refreshInterval: refreshInterval)
     }
 }

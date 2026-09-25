@@ -47,8 +47,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
 
             if CommandLine.arguments.contains("--open-settings") {
-                DispatchQueue.main.async {
-                    self.showSettings()
+                // SwiftUI creates the store lazily and may do so after launch;
+                // showSettings() needs it, so wait for it instead of silently
+                // doing nothing.
+                AppStoreBridge.whenStoreAvailable { _ in
+                    DispatchQueue.main.async {
+                        self.showSettings()
+                    }
                 }
             }
         }
@@ -64,7 +69,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         MainActor.assumeIsolated {
             // Never leave a fan pinned under manual control with nothing watching
-            // temperature once the app is gone.
+            // temperature once the app is gone. The request is bounded, and the
+            // daemon independently recovers once this process exits.
             AppStoreBridge.store?.restoreAutomaticControlOnQuit()
             return .terminateNow
         }

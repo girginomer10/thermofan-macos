@@ -219,14 +219,12 @@ struct FanDevice: Identifiable, Hashable {
     /// persisted: it must be re-probed after every launch and wake.
     var controlInterface: FanControlInterface = .unavailable
     var lastCommand: String?
+    /// Mode read back from the SMC. `nil` means unknown (unreadable), never
+    /// manual; only `.fixed`/`.curve` mean the firmware reports manual control.
     var hardwareMode: FanMode? = nil
+    /// Raw, unclamped `F{i}Tg` target read back from the SMC, when readable.
     var hardwareTargetRPM: Int? = nil
     var controlState: FanControlState = .idle
-
-    var targetProgress: Double {
-        guard maxRPM > minRPM else { return 0 }
-        return Double(targetRPM - minRPM) / Double(maxRPM - minRPM)
-    }
 }
 
 struct FanPresetSetting: Codable, Hashable {

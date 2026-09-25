@@ -6,69 +6,6 @@ struct SensorPreference: Codable, Hashable {
     var isHidden: Bool
 }
 
-struct PersistedState: Codable {
-    var preferences: AppPreferences
-    var presets: [FanPreset]
-    var sensorPreferences: [String: SensorPreference]
-    var fanSettings: [String: FanPresetSetting]
-    var customIndexes: [ThermalIndex]
-
-    init(
-        preferences: AppPreferences,
-        presets: [FanPreset],
-        sensorPreferences: [String: SensorPreference],
-        fanSettings: [String: FanPresetSetting],
-        customIndexes: [ThermalIndex]
-    ) {
-        self.preferences = preferences
-        self.presets = presets
-        self.sensorPreferences = sensorPreferences
-        self.fanSettings = fanSettings
-        self.customIndexes = customIndexes
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case preferences
-        case presets
-        case sensorPreferences
-        case fanSettings
-        case customIndexes
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        preferences = try container.decode(AppPreferences.self, forKey: .preferences)
-        presets = try container.decode([FanPreset].self, forKey: .presets)
-        sensorPreferences = try container.decode([String: SensorPreference].self, forKey: .sensorPreferences)
-        fanSettings = try container.decode([String: FanPresetSetting].self, forKey: .fanSettings)
-        customIndexes = try container.decodeIfPresent([ThermalIndex].self, forKey: .customIndexes) ?? []
-    }
-}
-
-final class PersistenceController: @unchecked Sendable {
-    private let fileURL: URL
-
-    init() {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        let directory = support.appendingPathComponent("ThermoFan", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        fileURL = directory.appendingPathComponent("state.json")
-    }
-
-    func load() -> PersistedState? {
-        guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(PersistedState.self, from: data)
-    }
-
-    func save(_ state: PersistedState) {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(state) else { return }
-        try? data.write(to: fileURL, options: [.atomic])
-    }
-}
-
 final class HardwareProbe: @unchecked Sendable {
     private let smc: (any SMCReadingProviding)?
     private let hidReader: any HIDTemperatureReadingProviding
