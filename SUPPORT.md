@@ -53,8 +53,11 @@ final Auto recovery has been verified.
 
 ### Hardware recovery requires attention
 
-Do not retry manual control. Select **Return to Auto** or **Retry Recovery** and
-confirm every fan reports **Hardware: Auto**. **Retry Recovery** only asks the
+Do not retry manual control; every manual control is disabled in this state and
+**Return to Auto** is hidden because it shares the write path. In the current
+development build **Retry Recovery** is a placeholder (see `docs/HANDOFF.md`);
+the Hardware Helper retries Auto on its own. Confirm every fan reports
+**Hardware: Auto**. **Retry Recovery** only asks the
 Hardware Helper to re-verify that ThermoFan-owned fans are back in Auto. It
 never writes a manual fan target and never registers, unregisters, or
 re-registers the service. Protocol 9 keeps writes blocked when startup,

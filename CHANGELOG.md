@@ -58,6 +58,68 @@ and the project uses semantic versioning while it remains pre-1.0.
 
 ### Fixed
 
+- **Retry Recovery** no longer unregisters and re-registers the Hardware
+  Helper. A daemon whose protocol and revision are current but reports
+  recovery required is asked to retry verified Auto directly; it is never sent
+  through `prepareForServiceRemoval`, whose retiring state used to latch
+  permanently and reject every later request. The fan-card and preset buttons
+  can no longer follow a recovery retry with a manual write, and all manual
+  controls are disabled while recovery is blocked. The Retry Recovery button
+  itself still calls a placeholder until the pending `ThermalStore` work lands
+  (see `docs/HANDOFF.md`).
+- The service facade now caches the code-signature checks and offers a
+  non-blocking helper-state snapshot plus a background refresh. Moving the
+  store's per-tick status check off the main thread is pending in the unmerged
+  `ThermalStore` branch.
+- The client now reports every lease the daemon ended on its own (heartbeat
+  expiry, XPC loss, daemon restart, console-user change, recovery after a
+  failed write) through a lease-lost callback and treats status `76` as
+  recovery required. The store subscription that updates fan cards is pending
+  in the unmerged branch.
+- Apple HID/PMU sensors no longer flicker in and out of the sensor list as the
+  per-sample SMC count changes; the supplement decision is latched for the
+  session. HID die and cluster channels are now categorized as CPU/GPU so they
+  can serve as curve sources and fallbacks.
+- The daemon now answers a background login session with a distinct
+  not-console-user status, answers `76` whenever it ended the caller's lease
+  itself, lets a newer connection from the same app process take over its
+  lease, recovers durable ownership before its Developer ID self-check, installs
+  signal handlers before the startup barrier, requires a launchd parent,
+  enforces the request revision for Auto under a lease, re-verifies durable
+  state on removal and shutdown, re-runs legacy cleanup if a legacy helper
+  reappears, and answers handshakes from a snapshot so a long SMC transaction
+  cannot make the app report it as needing an update.
+- The app distinguishes monitoring-only builds, an app outside
+  `/Applications`, an inactive login session, and an unresponsive helper from
+  a genuine update requirement; only the last offers Update, and a handshake
+  timeout no longer unregisters a daemon that was merely busy. Manual writes
+  are refused app-side while a legacy privileged helper exists, an invalid RPM
+  is rejected before a lease is armed, readiness is polled for up to 30 seconds
+  after registration, and quit uses a bounded return-to-Auto.
+- The arm64 helper no longer contains the Intel `FS!` code or string; the exit
+  watch consume is bounded; a lock failure escalates to recovery required when
+  a fan may be owned; recovery always resets `Ftst`; the interrupted v8
+  `.installing` helper path is retired; legacy processes are tracked by PID and
+  start time across retries; and ownership state moved to a root-only
+  `/var/run/thermofan` directory written with `F_FULLFSYNC`.
+- SMC metadata misses are cached only for key-not-found results, a failed SMC
+  open is retried with a descriptive warning, a transient fan read no longer
+  cancels manual control on every fan (three consecutive misses are required),
+  the CPU core family and `Tp0P` meaning are fixed per session, the raw
+  hardware target is shown instead of a clamped value, unknown hardware mode is
+  no longer displayed as manual, HID readings use the same plausibility window
+  as the SMC path, and the unused user-process SMC write path was removed.
+- Number and curve fields commit their drafts before Apply and across
+  Settings page switches, a hidden linked sensor stays selectable, estimated
+  readings are marked in the menu bar and panel header, and Unregister asks
+  for confirmation.
+- Packaging identifiers and the implementation revision are read from the
+  Swift contract by a shared `scripts/packaging_contract.sh`, CI scans sources
+  for legacy command markers (short Swift literals were invisible to the
+  binary `strings` check), the arm64 helper is required to contain no `FS!`
+  string, direct releases require a successful CI run for the released commit,
+  and `XPCContractTests` pins the eight selectors, their reply encodings, and
+  every status constant.
 - The root daemon now arms its exact-process watchdog before the first manual
   write; one-shot fixed/curve CLI writes are unavailable.
 - A rollback that cannot be verified is no longer collapsed into a generic

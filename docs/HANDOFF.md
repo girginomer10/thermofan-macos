@@ -140,3 +140,108 @@
   complete physical write/recovery acceptance across M1-M5 models. Move the
   macOS 14 minimum-runtime gate to a physical/self-hosted runner before GitHub's
   hosted image retires on 2026-11-02.
+
+## 2026-09-25 01:30 +03 - Claude Fable 5.1
+
+- Task: Deep runtime wiring and reachability audit (`/deepreview`) of the
+  whole app, then parallel fixes for every finding through seven subagents in
+  isolated worktrees with disjoint file ownership. The user stopped the work
+  before the last workstream could be reviewed and merged.
+- Changed (merged to `main`, squash-merged per workstream, builds warning-free,
+  60 tests pass, ad-hoc package builds and passes the `FS!`, legacy-marker, and
+  source scans):
+  - `7cccfb4` shared contract: `implementationRevision` 10, XPC statuses 77
+    (not console user) and 78 (retiring), `HardwareHelperState`
+    `.monitoringOnly`/`.wrongLocation`/`.inactiveSession`/`.unreachable`,
+    `FanControlService.cachedHelperState`/`refreshHelperState()`/
+    `retryAutomaticRecovery()`/`onLeaseLost`.
+  - Packaging/CI/docs: `scripts/packaging_contract.sh`, source-level legacy
+    marker scan, helper `FS!` check, release CI gate (`THERMOFAN_SKIP_CI_CHECK`
+    bypass, `CIVerification` evidence key), `.gitignore` secrets, README
+    `rm -rf` before `ditto`, COMPATIBILITY/DISTRIBUTION/SUPPORT/CONTRIBUTING
+    wording, `Tests/ThermoFanTests/XPCContractTests.swift`.
+  - Client (`PrivilegedFanClient.swift`, `FanControlService.swift`,
+    `HardwareHelperStateTests.swift`): recovery-blocked never goes through
+    removal; pure `deriveState`; cached signature checks; lease-lost callback;
+    heartbeat lease generation; RPM validated before arming; 30 s readiness
+    poll; manual writes refused with a legacy helper present;
+    `returnAllToAutomatic(timeout:)`.
+  - Hardware (`HardwareProbe.swift`, `SMCClient.swift`,
+    `HIDTemperatureReader.swift`, `HardwareCompatibility.swift`,
+    `CommandLineEntrypoint.swift`, `HardwareCompatibilityTests.swift`): HID
+    supplement latch, HID categories, key-not-found-only cache, unknown mode
+    stays nil, raw `hardwareTargetRPM`, SMC open retry, 3-sample fan-read
+    debounce, sticky core family, HID re-enumeration, plausibility window,
+    dead code removed, `--diagnose` extended.
+  - Daemon (`Sources/ThermoFanHelper/main.swift`): 60 s retiring window
+    cleared by a verified retry, 77/76 semantics, same-process takeover,
+    startup order (root, launchd parent, signals, recovery, Developer ID
+    check, legacy barrier), Auto revision check under a lease, durable re-check
+    on removal/shutdown, 30 s legacy re-check, snapshot handshakes.
+  - Views (`Views.swift`): recovery-blocked wiring and disabled controls, new
+    helper states, hardware-aware status headline, raw target, draft commit
+    registry, hidden-linked-sensor picker, estimated markers, Unregister
+    confirmation, misc. Contains a `// MERGE-STUB` extension at the bottom
+    providing no-op `retryAutomaticRecovery()`, `refreshHelperState()`, and
+    `trackedCurveFanIDs` on `ThermalStore`.
+  - C engine (`Helpers/ThermoFanHelper/main.c`, `ThermoFanEngine.h`): `FS!`
+    compiled out on arm64, bounded exit-watch consume (returns 2 on timeout),
+    lock failure escalates to 75, `Ftst` reset on every path, post-retirement
+    manual-fan scan, `.installing` legacy path, `/var/run/thermofan` state
+    directory with `F_FULLFSYNC`, legacy processes tracked by PID+start time.
+  - Docs: ARCHITECTURE, SAFETY, SUPPORT, CHANGELOG updated to describe only
+    what is merged; pending items are marked as such.
+- Verified: `swift build` (zero warnings), `swift test` (60 passed),
+  `./scripts/build_app.sh` (0.3.0 build 10, ad-hoc), `strings -n 3` helper
+  `FS!` check, binary and source legacy-marker scans, `bash -n` on all
+  scripts. Not verified: nothing was run against a registered daemon; no
+  physical fan write; CI on GitHub has not yet run for these commits.
+- Memory: none written; durable lessons are in the code comments and this
+  entry.
+- INCOMPLETE / HALF DONE (do these next, in order):
+  1. `ThermalStore` workstream is NOT merged. Its agent hit an API rate limit
+     before self-review. The work is preserved as WIP commit `7479044` on the
+     pushed branch `worktree-agent-a3ed5e78544878a77` (worktree
+     `.claude/worktrees/agent-a3ed5e78544878a77`). It builds and passes 55
+     tests against base `7cccfb4` only. It touches `ThermalStore.swift`,
+     `Models.swift`, `SensorContinuity.swift`, `ThermoFanApp.swift`, moves
+     `PersistedState`/`PersistenceController` from `HardwareProbe.swift` into
+     new `Persistence.swift`, and adds `PersistenceTests.swift`. It was meant
+     to cover: main-actor use of `cachedHelperState`/`refreshHelperState()`;
+     curve first-apply race (`sameConfiguration` ignoring `targetRPM`);
+     applied-curve tracking with `trackedCurveFanIDs`; `onLeaseLost`
+     subscription and `hardwareMode` reconciliation; placeholder fans not
+     wiped; wake re-apply/reset fixes; recovery-limit observation; nil
+     "Hottest sensor" tracking; estimated readings excluded from curves and
+     indexes; state.json backup on decode failure and ordered quit flush;
+     keyed warnings; median-based curve evaluation; preset/index edge cases;
+     bounded quit and App Nap opt-out; `retryAutomaticRecovery()` and
+     `refreshHelperState()` store methods; dead-code removal. REVIEW IT FIRST,
+     then rebase onto `main` (expect conflicts only in `HardwareProbe.swift`
+     around the deleted persistence block; the hardware branch left lines
+     1-72 untouched), delete the `// MERGE-STUB` extension at the bottom of
+     `Views.swift`, and re-run build/tests/package.
+  2. After that merge, add on the store: a published set of fans in automatic
+     recovery (views currently guess "Recovering…"), a published median-backed
+     value for the hottest sensor (panel header falls back to raw), and widen
+     the GPU Average index filter (about `ThermalStore.swift:941`) to include
+     the hardware branch's "GPU Core N" names, then re-enable the CHANGELOG
+     bullets and doc sentences that were downgraded to "pending".
+  3. Until step 1 lands: the main-thread stall on each tick (P1), stale
+     "Manual control active" after a daemon-ended lease (P1), silent curve
+     tracking stall (P1), and placeholder wipe (P1) remain open on `main`;
+     the Retry Recovery button is a no-op placeholder (the daemon supervisor
+     still retries on its own, and the client no longer routes recovery
+     through service removal).
+  4. Daemon revision is 10: the first launch of this build against a
+     registered revision-9 daemon will require the update flow
+     (unregister/re-register, Login Items approval may be asked again).
+  5. CI risks noted by the packaging agent: the new matrix `include`/`runner`
+     expressions have not run on GitHub; the XPC encoding test was checked only
+     with Swift 6.3.3, not Xcode 16.2 on macos-14; the macos-14 hosted runner
+     retires 2026-11-02 (`ci.yml` `runner:` line).
+  6. The six merged worktrees under `.claude/worktrees/` and their
+     `worktree-agent-*` branches (all except `a3ed5e78544878a77`) are safe to
+     remove with `git worktree remove` and `git branch -D`.
+  7. Physical write/recovery acceptance on M1-M5 and the Developer ID /
+     notarization setup from the previous entry are still open.
